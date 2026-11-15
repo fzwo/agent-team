@@ -2,7 +2,7 @@
 # Regression suite for the plugin's scripts. Runs anywhere with bash, python3, jq and git;
 # needs no GitHub (gh is stubbed) and touches nothing outside a scratch directory.
 #   tests/run.sh            run everything
-#   tests/run.sh lock       one group: lock | guard | watcher | cleanup | changelog | install | shift | sweep
+#   tests/run.sh lock       one group: lock | guard | watcher | cleanup | changelog | install | shift | sweep | publish
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 # The caller's environment must not leak into the scripts under test.
@@ -20,7 +20,7 @@ ok()   { pass=$((pass+1)); echo "  ok   $1"; }
 bad()  { fail=$((fail+1)); echo "  FAIL $1" >&2; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; fi; }
 want="${1:-all}"
-case "$want" in all|lock|guard|watcher|cleanup|changelog|install|shift|sweep) ;; *) echo "unknown group: $want (lock|guard|watcher|cleanup|changelog|install|shift|sweep)" >&2; exit 2 ;; esac
+case "$want" in all|lock|guard|watcher|cleanup|changelog|install|shift|sweep|publish) ;; *) echo "unknown group: $want (lock|guard|watcher|cleanup|changelog|install|shift|sweep|publish)" >&2; exit 2 ;; esac
 run() { [ "$want" = all ] || [ "$want" = "$1" ]; }
 
 if run lock; then echo "lock"
@@ -142,17 +142,18 @@ if run lock; then echo "lock"
   AGENTLOCK_OWNER=A $L acquire sim:p --ttl 1m >/dev/null
   ( sleep 2; AGENTLOCK_OWNER=A $L release sim:p >/dev/null ) & PATH="$work/nops:$PATH" AGENTLOCK_POLL=1 AGENTLOCK_OWNER=B $L acquire sim:p --ttl 1m --wait 10s >/dev/null 2>&1; check "a failing ps does not end the wait: the lock is acquired once released" $? 0
   AGENTLOCK_OWNER=B $L release sim:p >/dev/null
-  AGENTLOCK_OWNER=A $L acquire ui --ttl 1m >/dev/null
-  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W exec bash -c "$L acquire ui --wait 30s >/dev/null 2>&1; echo waiter-exit=\$? > '$work/waiter.rc'" ) & wsh=$!
+  # The lock name carries this suite's pid: the pgrep below is machine-wide and once saw another suite's waiter (round 47).
+  AGENTLOCK_OWNER=A $L acquire ui --ttl 1m >/dev/null; AGENTLOCK_OWNER=A $L acquire "orphan$$" --ttl 1m >/dev/null
+  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W exec bash -c "$L acquire orphan$$ --wait 30s >/dev/null 2>&1; echo waiter-exit=\$? > '$work/waiter.rc'" ) & wsh=$!
   sleep 1.5; { kill -KILL $wsh; wait $wsh; } 2>/dev/null; sleep 3
-  pgrep -f "agentlock acquire ui --wait 30s$" >/dev/null && bad "an orphaned --wait kept waiting" || ok "an orphaned --wait gives up when its shell is gone"
-  pkill -f "agentlock acquire ui --wait 30s$" 2>/dev/null
+  pgrep -f "agentlock acquire orphan$$ --wait 30s$" >/dev/null && bad "an orphaned --wait kept waiting" || ok "an orphaned --wait gives up when its shell is gone"
+  pkill -f "agentlock acquire orphan$$ --wait 30s$" 2>/dev/null
   # A wait started detached, `( … & )`, has no shell from the start: it gives up at its first poll instead of waiting its limit.
   # The child starts a second after its subshell has exited, so the waiter is reparented before bash reads its parent
   # (a `while kill -0 $PPID` loop would not do: in sh, PPID follows the reparenting to pid 1, which is alive).
-  ( sh -c 'sleep 1; exec env AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W "$0" acquire ui --wait 25s >/dev/null 2>&1' "$L" & ); sleep 4
-  pgrep -f "agentlock acquire ui --wait 25s$" >/dev/null && bad "a detached --wait kept waiting" || ok "a detached --wait gives up at once"
-  pkill -f "agentlock acquire ui --wait 25s$" 2>/dev/null; AGENTLOCK_OWNER=A $L release ui >/dev/null
+  ( sh -c 'sleep 1; exec env AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W "$0" acquire "$1" --wait 25s >/dev/null 2>&1' "$L" "orphan$$" & ); sleep 4
+  pgrep -f "agentlock acquire orphan$$ --wait 25s$" >/dev/null && bad "a detached --wait kept waiting" || ok "a detached --wait gives up at once"
+  pkill -f "agentlock acquire orphan$$ --wait 25s$" 2>/dev/null; AGENTLOCK_OWNER=A $L release ui >/dev/null; AGENTLOCK_OWNER=A $L release "orphan$$" >/dev/null
   AGENTLOCK_OWNER=A $L release sim:w >/dev/null
   AGENTLOCK_OWNER=A $L with sim:w --wait --ttl 1m -- true >/dev/null 2>&1; check "with: a bare --wait is accepted" $? 0
   cp "$here/hooks/guard.conf.example" "$AGENTLOCK_DIR/guard.conf"; mkdir -p "$AGENTLOCK_DIR/locks"; touch "$AGENTLOCK_DIR/locks/afile"
@@ -947,10 +948,18 @@ if run sweep; then echo "sweep"
   check "sweep without lsof: exits 0" $rc 0
   [ -f "$sw/_Users_me_x.lock" ] && printf '%s' "$out" | grep -q "lsof not found: lock files are left alone" && ok "sweep without lsof: lock files stay and the report says why" || bad "without lsof: $out / $(ls -A "$sw")"
   [ ! -d "$sw/TemporaryDirectory.aaaaaa" ] && ok "sweep without lsof: the folders are still swept" || bad "folders not swept without lsof"
-  refused=1; for d in / "$HOME" /usr /etc; do bash "$here/scripts/tmp-sweep.sh" --delete "$d" >/dev/null 2>&1; [ $? = 2 ] || { refused=""; bad "sweep accepted $d"; }; done; [ -z "$refused" ] || ok "sweep: refuses /, the home and system directories"
+  # The refusal, by message, not exit code (2 is also "no such directory"). //etc and // are what bash keeps of a doubled slash.
+  # The given-name check (macOS: /etc given, /private/etc resolved) cannot be built here without root; /private/etc is tried for the Mac's run.
+  ln -s /etc "$work/sweep/to-etc"; refused=1; for d in / // "$HOME" /usr //usr /etc /etc/ //etc "$work/sweep/to-etc"; do out=$(bash "$here/scripts/tmp-sweep.sh" --delete "$d" 2>&1); [ $? = 2 ] && printf '%s' "$out" | grep -q "refusing to sweep" || { refused=""; bad "sweep accepted $d: $out"; }; done; [ -z "$refused" ] || ok "sweep: refuses /, the home, system directories, with a trailing or a doubled slash, and a symlink to one"
+  mkdir -p "$work/sweep/cdp2/scratch" "$work/sweep/elsewhere/scratch"; : > "$work/sweep/elsewhere/scratch/x"; out=$(cd "$work/sweep/cdp2" && CDPATH="$work/sweep/elsewhere" bash "$here/scripts/tmp-sweep.sh" scratch 2>&1); printf '%s' "$out" | grep -q "cdp2/scratch: 0 entries" && ok "sweep: a relative directory is the one named, not CDPATH's match" || bad "CDPATH match swept: $out"
+  [ -d /private/etc ] && { bash "$here/scripts/tmp-sweep.sh" /private/etc 2>&1 | grep -q "refusing to sweep" && ok "sweep: refuses /private/etc (macOS)" || bad "sweep accepted /private/etc"; } || true
   bash "$here/scripts/tmp-sweep.sh" --delete "$work/sweep/nowhere" >/dev/null 2>&1; check "sweep: a missing directory is a bad call, exit 2" $? 2
   TMPDIR= bash "$here/scripts/tmp-sweep.sh" >/dev/null 2>&1; check "sweep: no TMPDIR and no argument is a bad call, exit 2" $? 2
   h=$(bash "$here/scripts/tmp-sweep.sh" --help); printf '%s' "$h" | grep -q -- '--age-hours' && [ "$(printf '%s' "$h" | tail -1)" = "are not debris; the project's worktree hook removes those." ] && ok "sweep: --help prints the whole header" || bad "sweep --help: $(printf '%s' "$h" | tail -1)"
+fi
+
+if run publish; then echo "publish"
+  if [ -f "$here/tests/publish.sh" ]; then . "$here/tests/publish.sh"; else echo "  (skipped: tests/publish.sh is kept out of the public copy, with scripts/publish-subs.py)"; fi
 fi
 
 echo; echo "passed $pass, failed $fail"; [ $fail -eq 0 ]

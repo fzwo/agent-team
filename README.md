@@ -19,6 +19,7 @@ It grew out of one iOS project (about 300 merged PRs in three weeks). `ASSESSMEN
 | `scripts/gh-labels.sh`, `changelog-new.sh`, `changelog-render.sh`, `pr-cleanup.sh` | Labels, changelog entries, the rendered changelog view, cleanup that checks MERGED first and runs the project's worktree hook |
 | `scripts/install-mac.sh`, `host-add.sh`, `shift-start.sh` | Mac setup, a launchd host per project folder, a named shift from the command line |
 | `scripts/tmp-sweep.sh` | counts, and with `--delete` removes, known toolchain debris in the Mac's temporary directory (SwiftPM and Interface Builder leftovers that macOS clears only at reboot) |
+| `scripts/publish.sh`, `publish-subs.py` | the maintainer's release step: the private repository's HEAD, rewritten for the public copy, as one commit per version in the public install source; the list of names and its test fixture are kept out of the public copy, where the script refuses to run |
 | `tests/run.sh` | The regression suite for the scripts |
 | `templates/` | CLAUDE.md lines, `design/README.md`, state file, issue templates, decision-expiry workflow, git-ignore entries |
 

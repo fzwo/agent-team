@@ -27,12 +27,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$dir" ] || { echo "tmp-sweep.sh: no directory: TMPDIR is not set and none was given" >&2; exit 2; }
+unset CDPATH   # with it set, `cd` of a relative name could go to a directory other than the one tested below
 [ -d "$dir" ] || { echo "tmp-sweep.sh: no such directory: $dir" >&2; exit 2; }
-dir=$(cd "$dir" && pwd -P)
-# Never the root, a home, or anything that is not plainly a temporary directory: the script removes files.
-case "$dir" in
-  /|/home|/home/*|/Users|/Users/*|/private|/var|/private/var|/etc|/etc/*|/usr|/usr/*|/opt|/opt/*|/System|/System/*|/Library|/Library/*|/Applications|/Applications/*) echo "tmp-sweep.sh: refusing to sweep $dir" >&2; exit 2 ;;
-esac
+given=$(cd -- "$dir" >/dev/null && pwd -L | sed 's#^//*#/#'); dir=$(cd -- "$dir" >/dev/null && pwd -P | sed 's#^//*#/#')   # bash keeps a leading //; cd echoes under CDPATH
+# Never the root, a home, or anything that is not plainly a temporary directory: the script removes files. Checked
+# by the name as given and by the resolved one: on macOS /etc resolves to /private/etc (round 47, the Mac).
+forbidden() { case "$1" in
+  /|/home|/home/*|/Users|/Users/*|/private|/var|/private/var|/etc|/etc/*|/private/etc|/private/etc/*|/usr|/usr/*|/opt|/opt/*|/System|/System/*|/Library|/Library/*|/Applications|/Applications/*) return 0 ;; esac; return 1; }
+if forbidden "$given" || forbidden "$dir"; then echo "tmp-sweep.sh: refusing to sweep $dir" >&2; exit 2; fi
 [ "$dir" != "${HOME:-/nonexistent}" ] || { echo "tmp-sweep.sh: refusing to sweep the home directory" >&2; exit 2; }
 mins=$(( age_hours * 60 ))
 # The entry count by find, not ls: on macOS `ls -f` turns `.` and `..` on and a later `-A` does not turn them off.

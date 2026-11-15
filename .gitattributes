@@ -1,0 +1,4 @@
+# Kept out of `git archive`, and so out of the public copy: these two files hold the names that
+# scripts/publish-subs.py exists to remove from it (its substitution list, and the fixture that tests it).
+scripts/publish-subs.py export-ignore
+tests/publish.sh export-ignore
