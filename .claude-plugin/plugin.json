@@ -1,7 +1,7 @@
 {
   "name": "agent-team",
   "description": "A development process for one owner and two agents: an engineering agent and a design agent talking through GitHub issues, adversarial review with re-review of every fix, machine-wide locks for shared Macs, and templates to set a repo up.",
-  "version": "0.4.22",
+  "version": "0.4.23",
   "author": {
     "name": "fzwo"
   },

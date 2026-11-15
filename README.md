@@ -18,6 +18,7 @@ It grew out of one iOS project (about 300 merged PRs in three weeks). `ASSESSMEN
 | `scripts/watch-github.py` | Polls GitHub for input addressed to a role and wakes a session; no tokens while waiting |
 | `scripts/gh-labels.sh`, `changelog-new.sh`, `changelog-render.sh`, `pr-cleanup.sh` | Labels, changelog entries, the rendered changelog view, cleanup that checks MERGED first and runs the project's worktree hook |
 | `scripts/install-mac.sh`, `host-add.sh`, `shift-start.sh` | Mac setup, a launchd host per project folder, a named shift from the command line |
+| `scripts/tmp-sweep.sh` | counts, and with `--delete` removes, known toolchain debris in the Mac's temporary directory (SwiftPM and Interface Builder leftovers that macOS clears only at reboot) |
 | `tests/run.sh` | The regression suite for the scripts |
 | `templates/` | CLAUDE.md lines, `design/README.md`, state file, issue templates, decision-expiry workflow, git-ignore entries |
 
@@ -34,6 +35,8 @@ claude plugin install agent-team@fzwo --scope user
 ```
 
 The marketplace is registered under the name in its `marketplace.json`, `fzwo`, not under the repo name. User scope applies to every project on that machine. Inside every Claude Code session the plugin's session-start hook puts its `scripts/` directory on the PATH, so `agentlock` and the other scripts resolve by name without any shell configuration. To work on the plugin itself, run `claude --plugin-dir /path/to/agent-team` in any project and `/reload-plugins` after edits.
+
+Two repositories: `fzwo/agent-team`, public, is the install source and holds the plugin at each release, one commit per release, with the project it was built on called "the first project" and the machine that runs its agents "the agent Mac"; `fzwo/agent-team-dev`, private, holds the full history, the pull requests and the record's issue numbers. Three checks of the test suite read a 0.3.x copy of the lock tool out of that history and run only there: the private suite passes 456 checks, the public copy 453 (as of 0.4.22).
 
 ## Apply to a project
 
@@ -73,7 +76,7 @@ Sessions started from the app land in the folder where `claude remote-control` r
 
 **Web projects** run on the agent Mac by default, the same way as Apple projects, with the app and its tests in a Linux container on the Mac and a green Linux CI run as a merge condition; deploys run from GitHub Actions. The cloud is the fallback.
 
-**In the cloud (fallback).** Engineering sessions start from the app with the repo selected. Containers are fresh per session, so a user-scope plugin install does not persist: install the plugin in the environment's setup script, or commit a project-scope enablement in `.claude/settings.json`; either way the container must be able to fetch this repo, which is simplest if it is public (it is MIT and holds no secrets). The lock directory is per machine and coordinates nothing between cloud sessions; the web profile avoids shared resources (database and port per branch, preview deploy per PR) instead of locking them. The watcher runs as a background command that exits on input (`--exit-on-input --max-minutes`), restarted by the session; between shifts, a scheduled task that runs it once every few hours is the fallback. Design runs the app in its own container with a headless browser. Untested as of 2026-11-02; the Mac path is the tested one.
+**In the cloud (fallback).** Engineering sessions start from the app with the repo selected. Containers are fresh per session, so a user-scope plugin install does not persist: install the plugin in the environment's setup script (a project-scope enablement committed in `.claude/settings.json` is the other route; untested). Checked once, on 2026-11-15: a cloud environment whose setup script runs `claude plugin marketplace add fzwo/agent-team || true` and `claude plugin install agent-team@fzwo --scope user || true` gave a fresh session the plugin installed, in under two seconds, with its four skills listed; no hook or skill was exercised in that check. It works because `fzwo/agent-team` is public: a private source fails there, since the script runs before the session has any GitHub credential, and a container cached from a failed script was rebuilt once the script's text changed. A `discover` session, which needs the web and a repository, not the Mac, is the first use of this. The rest of this paragraph is untested as of 2026-11-02. The lock directory is per machine and coordinates nothing between cloud sessions; the web profile avoids shared resources (database and port per branch, preview deploy per PR) instead of locking them. The watcher runs as a background command that exits on input (`--exit-on-input --max-minutes`), restarted by the session; between shifts, a scheduled task that runs it once every few hours is the fallback. Design runs the app in its own container with a headless browser. The Mac path is the tested one.
 
 ## Shifts
 

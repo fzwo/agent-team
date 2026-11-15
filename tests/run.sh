@@ -2,7 +2,7 @@
 # Regression suite for the plugin's scripts. Runs anywhere with bash, python3, jq and git;
 # needs no GitHub (gh is stubbed) and touches nothing outside a scratch directory.
 #   tests/run.sh            run everything
-#   tests/run.sh lock       one group: lock | guard | watcher | cleanup | changelog | install | shift
+#   tests/run.sh lock       one group: lock | guard | watcher | cleanup | changelog | install | shift | sweep
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 # The caller's environment must not leak into the scripts under test.
@@ -20,7 +20,7 @@ ok()   { pass=$((pass+1)); echo "  ok   $1"; }
 bad()  { fail=$((fail+1)); echo "  FAIL $1" >&2; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; fi; }
 want="${1:-all}"
-case "$want" in all|lock|guard|watcher|cleanup|changelog|install|shift) ;; *) echo "unknown group: $want (lock|guard|watcher|cleanup|changelog|install|shift)" >&2; exit 2 ;; esac
+case "$want" in all|lock|guard|watcher|cleanup|changelog|install|shift|sweep) ;; *) echo "unknown group: $want (lock|guard|watcher|cleanup|changelog|install|shift|sweep)" >&2; exit 2 ;; esac
 run() { [ "$want" = all ] || [ "$want" = "$1" ]; }
 
 if run lock; then echo "lock"
@@ -872,6 +872,85 @@ STUB
   ( cd "$work/shift/sr" && printf 'Shift: 7 ended 2026-11-06\n' > .agent-team/state.md && git add -A && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m e7b && git push -q origin main 2>/dev/null )
   stop_standins; wait $lp $wp $op $sp $cp_ $dp $qp 2>/dev/null
   trap 'rm -rf "$work"' EXIT
+fi
+
+if run sweep; then echo "sweep"
+  # tmp-sweep.sh: only the three debris shapes, only old, only with --delete; the rest of the directory is untouched.
+  sw="$work/sweep/T"; mkdir -p "$sw"
+  plant() { ( cd "$sw" && for n in aaaaaa bbbbbb cccccc dddddd; do mkdir -p TemporaryDirectory.$n; : > TemporaryDirectory.$n/.keep-directory; done
+    echo x > TemporaryDirectory.cccccc/extra; mkdir -p ibtoold-4194301/IB ibtoold-4194302/IB ibtoold-4194303 "ibtoold-$$/IB" keepme
+    mkfifo ibtoold-4194301/IB/a.HostToRemote ibtoold-4194301/IB/a.RemoteToHost "ibtoold-$$/IB/b.HostToRemote"   # a finished tool's channels; a live pid's channels
+    mkfifo ibtoold-4194302/IB/c.HostToRemote; echo y > ibtoold-4194302/IB/notes   # a regular file beside the pipes: not the shape
+    mkdir -p ibtoold-4194304/IB; mkfifo ibtoold-4194304/IB/d.HostToRemote   # the shape, but new: stays
+    mkdir -p ibtoold-4194305/IB; ln -s ../../ibtoold-4194301/IB/a.HostToRemote ibtoold-4194305/IB/link   # a symlink to a pipe: not the shape, stays
+    mkdir -p ibtoold-4194306; ln -s ../ibtoold-4194301/IB ibtoold-4194306/IB   # IB itself a symlink to another tool's pipes: not the shape, stays
+    mkdir -p targets/lonely targets/pipes; : > targets/lonely/.keep-directory; mkfifo targets/pipes/p.HostToRemote; : > targets/zero.lock   # targets of depth-1 symlinks: must survive
+    ln -s targets/lonely TemporaryDirectory.linkdr; ln -s targets/pipes ibtoold-4194307; ln -s targets/zero.lock _Users_link_x.lock   # symlinks at depth 1: not the shapes
+    mkdir -p ibtoold-4194308/IB; mkfifo ibtoold-4194308/IB/e.HostToRemote; : > ibtoold-4194308/IB/.hidden   # a dotfile beside the pipes: not the shape
+    mkdir -p ibtoold-4194309/IB; mkfifo ibtoold-4194309/IB/f.HostToRemote; : > ibtoold-4194309/.hiddenfile   # a dotfile beside IB: not the shape
+    : > "$(printf '_Users_tab\tx.lock')"   # old, held open during the run, with a name lsof escapes: the whole class must then stay
+    : > _Users_new_x.lock   # the shape, but new: stays
+    : > _Users_held_x.lock   # old, held open by a process during the run: stays
+    mkdir -p TemporaryDirectory.eeeeee; echo content > TemporaryDirectory.eeeeee/.keep-directory   # old, marker with content: stays
+    : > _private_var_folders_zz_T_proj-ios-build-abc_dd_SourcePackages_x.lock; : > _Users_me_x.lock; echo z > _private_var_folders_full.lock; : > other.lock; echo k > keepme/file
+    touch -h -t 202001010000 TemporaryDirectory.linkdr ibtoold-4194307 _Users_link_x.lock 2>/dev/null || true
+    touch -t 202001010000 targets/lonely targets/pipes targets/zero.lock ibtoold-4194308 ibtoold-4194309 "$(printf '_Users_tab\tx.lock')"
+    touch -t 202001010000 TemporaryDirectory.aaaaaa TemporaryDirectory.bbbbbb TemporaryDirectory.cccccc TemporaryDirectory.eeeeee ibtoold-4194301 ibtoold-4194302 ibtoold-4194303 ibtoold-4194305 ibtoold-4194306 "ibtoold-$$" _private_var_folders_zz_T_proj-ios-build-abc_dd_SourcePackages_x.lock _Users_me_x.lock _Users_held_x.lock _private_var_folders_full.lock other.lock keepme ); }
+  plant
+  # The lock class is gated on build tools running on the machine; the Mac that runs this suite usually has one, so the
+  # counting runs see a pgrep that finds nothing. One run under the real PATH checks the exit status only.
+  mkdir -p "$work/sweep/nobuild"; printf '#!/bin/bash\nexit 1\n' > "$work/sweep/nobuild/pgrep"; chmod +x "$work/sweep/nobuild/pgrep"
+  sweep() { PATH="$work/sweep/nobuild:$PATH" bash "$here/scripts/tmp-sweep.sh" "$@"; }
+  bash "$here/scripts/tmp-sweep.sh" "$sw" >/dev/null 2>&1; check "sweep: a report run under the real PATH exits 0" $? 0
+  out=$(sweep --warn-entries 5 "$sw" 2>&1); rc=$?
+  check "sweep: a report run exits 0" $rc 0
+  [ "$(ls -A "$sw" | wc -l | tr -d ' ')" = 26 ] && ok "sweep: a report run removes nothing" || bad "a report run removed something: $(ls -A "$sw")"
+  printf '%s' "$out" | grep -q "^warning: 26 entries" && ok "sweep: warns above the entry threshold" || bad "no entry warning: $out"
+  printf '%s' "$out" | grep -q "TemporaryDirectory.\* folders: 5; debris .*: 2; would remove: 2" && ok "sweep: counts the lone-marker folders older than a day, not the new one, the one with extra content or the one whose marker has content" || bad "TemporaryDirectory count: $out"
+  printf '%s' "$out" | grep -q "ibtoold-\* folders: 9; debris .*: 2; would remove: 2" && ok "sweep: counts the dead tools' old pipe folders and the empty one, not the live pid's, the new one, the ones with a file, a dotfile or a symlink" || bad "ibtoold count: $out"
+  if command -v lsof >/dev/null 2>&1; then
+    printf '%s' "$out" | grep -q "lock files: 6; debris .*: 4; would remove: 4" && ok "sweep: counts the old zero-length path-named lock files, not the full one, the new one, the symlink or other names" || bad "lock count: $out"
+    # A held lock whose name lsof escapes (a tab): the script cannot match it, so the whole class stays and the report says so.
+    ( exec 3<"$sw/$(printf '_Users_tab\tx.lock')"; sleep 20 ) & tholder=$!; sleep 0.5
+    out=$(sweep --delete "$sw" 2>&1); trc=$?
+    kill $tholder 2>/dev/null; wait $tholder 2>/dev/null
+    [ $trc = 0 ] && [ -f "$sw/_Users_me_x.lock" ] && printf '%s' "$out" | grep -q "a name this script cannot match, so lock files are left alone" && ok "sweep: an open lock lsof names in escaped form keeps the whole class" || bad "escaped-name hold: rc=$trc $out / $(ls -A "$sw" | tr '\n' ' ')"
+    rm -rf "$sw"; mkdir -p "$sw"; plant; rm -f "$sw/$(printf '_Users_tab\tx.lock')"
+  else
+    rm -f "$sw/$(printf '_Users_tab\tx.lock')"
+  fi
+  # During the deleting run a process holds one old lock open: it must stay.
+  ( exec 3<"$sw/_Users_held_x.lock"; sleep 20 ) & holder=$!; sleep 0.5
+  out=$(sweep --delete "$sw" 2>&1); rc=$?
+  kill $holder 2>/dev/null; wait $holder 2>/dev/null
+  [ $rc = 0 ] && ok "sweep: --delete exits 0" || bad "sweep: --delete exited $rc: $out"
+  left=$(ls -A "$sw" | sort | tr '\n' ' ')
+  sorted_words() { printf '%s\n' $1 | sort | tr '\n' ' '; }   # the expected list is compared as a set: the suite's pid sorts anywhere
+  if command -v lsof >/dev/null 2>&1; then left_want="TemporaryDirectory.cccccc TemporaryDirectory.dddddd TemporaryDirectory.eeeeee _Users_held_x.lock _Users_new_x.lock _private_var_folders_full.lock ibtoold-$$ ibtoold-4194302 ibtoold-4194304 ibtoold-4194305 ibtoold-4194306 ibtoold-4194307 ibtoold-4194308 ibtoold-4194309 TemporaryDirectory.linkdr _Users_link_x.lock targets keepme other.lock "; else left_want="TemporaryDirectory.cccccc TemporaryDirectory.dddddd TemporaryDirectory.eeeeee _Users_held_x.lock _Users_me_x.lock _Users_new_x.lock _private_var_folders_full.lock _private_var_folders_zz_T_proj-ios-build-abc_dd_SourcePackages_x.lock ibtoold-$$ ibtoold-4194302 ibtoold-4194304 ibtoold-4194305 ibtoold-4194306 ibtoold-4194307 ibtoold-4194308 ibtoold-4194309 TemporaryDirectory.linkdr _Users_link_x.lock targets keepme other.lock "; fi
+  left_want=$(sorted_words "$left_want")
+  [ "$left" = "$left_want" ] && ok "sweep: --delete removes exactly the debris and leaves the rest (the held lock, the new items and the marker with content stay)" || bad "sweep left '$left', wanted '$left_want'"
+  [ -f "$sw/keepme/file" ] && ok "sweep: an unrelated folder keeps its content" || bad "keepme touched"
+  [ -p "$sw/ibtoold-$$/IB/b.HostToRemote" ] && ok "sweep: a live tool's pipes stay" || bad "a live pid's ibtoold folder was touched"
+  [ -L "$sw/ibtoold-4194305/IB/link" ] && ok "sweep: a symlink to a pipe inside IB/ is not a pipe, the folder stays" || bad "the folder with a symlink was swept"
+  [ -L "$sw/ibtoold-4194306/IB" ] && ok "sweep: an IB that is itself a symlink keeps its folder" || bad "the folder whose IB is a symlink was swept"
+  [ -f "$sw/targets/lonely/.keep-directory" ] && [ -p "$sw/targets/pipes/p.HostToRemote" ] && [ -f "$sw/targets/zero.lock" ] && ok "sweep: the targets of depth-1 symlinks are untouched" || bad "a symlink's target was touched: $(ls -AR "$sw/targets")"
+  # A build tool running on the machine: the lock class is left alone this time, and the report says so.
+  rm -rf "$sw"; mkdir -p "$sw" "$work/sweep/build"; plant
+  printf '#!/bin/bash\nexit 0\n' > "$work/sweep/build/pgrep"; chmod +x "$work/sweep/build/pgrep"
+  out=$(PATH="$work/sweep/build:$PATH" bash "$here/scripts/tmp-sweep.sh" --delete "$sw" 2>&1); rc=$?
+  [ $rc = 0 ] && [ -f "$sw/_Users_me_x.lock" ] && printf '%s' "$out" | grep -q "a Swift or Xcode build tool is running: lock files are left alone" && ok "sweep: with a build tool running the lock files stay and the report says why" || bad "gate: rc=$rc $out / $(ls -A "$sw")"
+  [ ! -d "$sw/TemporaryDirectory.aaaaaa" ] && ok "sweep: with a build tool running the folders are still swept" || bad "folders not swept under the gate"
+  # Without lsof the lock files cannot be told from open ones: they stay, and the report says why.
+  rm -rf "$sw"; mkdir -p "$sw" "$work/sweep/nolsof"; plant
+  for t in bash ls find rm rmdir wc tr cat sed sort head mkdir pwd dirname basename touch kill mkfifo sleep; do p=$(command -v $t) && ln -sf "$p" "$work/sweep/nolsof/$t"; done
+  out=$(PATH="$work/sweep/nolsof" bash "$here/scripts/tmp-sweep.sh" --delete "$sw" 2>&1); rc=$?
+  check "sweep without lsof: exits 0" $rc 0
+  [ -f "$sw/_Users_me_x.lock" ] && printf '%s' "$out" | grep -q "lsof not found: lock files are left alone" && ok "sweep without lsof: lock files stay and the report says why" || bad "without lsof: $out / $(ls -A "$sw")"
+  [ ! -d "$sw/TemporaryDirectory.aaaaaa" ] && ok "sweep without lsof: the folders are still swept" || bad "folders not swept without lsof"
+  refused=1; for d in / "$HOME" /usr /etc; do bash "$here/scripts/tmp-sweep.sh" --delete "$d" >/dev/null 2>&1; [ $? = 2 ] || { refused=""; bad "sweep accepted $d"; }; done; [ -z "$refused" ] || ok "sweep: refuses /, the home and system directories"
+  bash "$here/scripts/tmp-sweep.sh" --delete "$work/sweep/nowhere" >/dev/null 2>&1; check "sweep: a missing directory is a bad call, exit 2" $? 2
+  TMPDIR= bash "$here/scripts/tmp-sweep.sh" >/dev/null 2>&1; check "sweep: no TMPDIR and no argument is a bad call, exit 2" $? 2
+  h=$(bash "$here/scripts/tmp-sweep.sh" --help); printf '%s' "$h" | grep -q -- '--age-hours' && [ "$(printf '%s' "$h" | tail -1)" = "are not debris; the project's worktree hook removes those." ] && ok "sweep: --help prints the whole header" || bad "sweep --help: $(printf '%s' "$h" | tail -1)"
 fi
 
 echo; echo "passed $pass, failed $fail"; [ $fail -eq 0 ]
