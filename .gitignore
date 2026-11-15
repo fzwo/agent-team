@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# The watcher writes its state next to the repo when run from a checkout (the same lines as templates/gitignore.snippet).
+.agent-team/watch-*.cursor
+.agent-team/watch-*.seen
+.agent-team/watch-*.summary
+.agent-team/watch-*.active
+.agent-team/watch-*.ideas

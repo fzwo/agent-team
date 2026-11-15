@@ -1,0 +1,35 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'input=$(cat); sid=$(printf %s \"$input\" | python3 -I -c \"import json,sys; print(json.load(sys.stdin).get(\\\"session_id\\\",\\\"\\\"))\" 2>/dev/null || printf %s \"$input\" | jq -r \".session_id // \\\"\\\"\" 2>/dev/null); [ -n \"${CLAUDE_ENV_FILE:-}\" ] || exit 0; [ -n \"$sid\" ] && echo \"export AGENTLOCK_OWNER=$sid\" >> \"$CLAUDE_ENV_FILE\"; echo \"export PATH=\\\"${CLAUDE_PLUGIN_ROOT}/scripts:\\$PATH\\\"\" >> \"$CLAUDE_ENV_FILE\"; exit 0'"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/agentlock guard"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'input=$(cat); sid=$(printf %s \"$input\" | python3 -I -c \"import json,sys; print(json.load(sys.stdin).get(\\\"session_id\\\",\\\"\\\"))\" 2>/dev/null || printf %s \"$input\" | jq -r \".session_id // \\\"\\\"\" 2>/dev/null); AGENTLOCK_OWNER=$sid \"${CLAUDE_PLUGIN_ROOT}\"/scripts/agentlock release-all >/dev/null 2>&1; exit 0'"
+          }
+        ]
+      }
+    ]
+  }
+}

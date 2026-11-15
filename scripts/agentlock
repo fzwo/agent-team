@@ -1,0 +1,942 @@
+#!/bin/bash
+# agentlock — machine-wide, advisory resource locks for agents that share one computer.
+#
+# Any process (a Claude Code session, a subagent, a script, the owner at the
+# keyboard) can take a named resource such as "ui", "sim:iPhone-16e",
+# "device:<udid>", "port:3000" or "db:dev". Locks live in one directory for
+# the whole machine, so sessions from different projects see each other.
+#
+# Works on the stock macOS bash 3.2 and on Linux. No dependencies beyond
+# coreutils, ps and (for `guard`) python3 or jq.
+#
+#   agentlock acquire <resource> [--ttl 30m] [--reason "..."] [--wait [10m]]   (--wait alone waits 60m; a wait ends when the shell that
+#                                                                                 started it is gone or was never there: `( … --wait & )`)
+#   agentlock renew <resource> [--ttl 30m]       push a held lock's expiry out by its own ttl, or by --ttl (the guard does the former on every guarded command)
+#   agentlock free <resource>                    exit 0 when nobody else holds it, 1 when someone does (`status` is a report and exits 0 either way)
+#   agentlock release <resource> [--force]
+#   agentlock release-all                 # everything this owner holds (a session: its builders' too)
+#   agentlock with <resource> [opts] -- <command...>   # acquire, run, release
+#   agentlock check <resource>            # exit 0 if held by this owner
+#   agentlock wait <resource> [timeout]   # block until it is free, without taking it
+#   agentlock status [resource]           # who holds what, stale marked
+#   agentlock clean                       # remove stale locks
+#   agentlock check-conf                  # validate guard.conf
+#   agentlock guard                       # Claude Code PreToolUse hook (see below)
+#   agentlock whoami                      # the owner id this process would use
+#   agentlock version                     # the plugin version this copy belongs to (a session keeps the copy it started with)
+#   AGENTLOCK_AS=<name> agentlock ...     # act as a sub-owner of this session (parallel builders)
+#
+# Owner identity: $AGENTLOCK_OWNER if set (a Claude Code SessionStart hook
+# sets it to the session id), otherwise the nearest ancestor process that is
+# claude or node, otherwise the parent shell. AGENTLOCK_AS=<name> makes a
+# sub-owner "<session>:<name>": sub-owners exclude each other, and the guard,
+# "quiet" and release-all treat a session and its sub-owners as one party.
+# A lock is stale when its holder's pid is gone or its TTL has passed.
+#
+# Two resources are special. "ui" is the convention for the screen and the
+# keyboard. "quiet" means a measurement needs the machine to itself: taking it
+# waits until no other party holds any lock, and while it is held no other
+# party gets a lock and the guard blocks their heavy commands (the "heavy"
+# rules in guard.conf, which otherwise need no lock).
+#
+# Layout: $AGENTLOCK_DIR (default ~/.agentlock) holds guard.conf and a locks/
+# directory with one directory per lock, created with mkdir (atomic on APFS,
+# HFS+, ext4). A lock directory without its info file is one being written;
+# it counts as stale only after a few seconds.
+
+set -u
+
+LOCK_ROOT="${AGENTLOCK_DIR:-$HOME/.agentlock}"
+LOCKS="$LOCK_ROOT/locks"
+DEFAULT_TTL="${AGENTLOCK_DEFAULT_TTL:-30m}"
+POLL_SECONDS="${AGENTLOCK_POLL:-5}"
+WRITE_GRACE=5        # seconds a lock dir may exist without info before it is stale
+WAIT_DEFAULT="60m"   # for a bare --wait
+
+die() { printf 'agentlock: %s\n' "$*" >&2; exit 1; }
+err() { printf 'agentlock: %s\n' "$*" >&2; return 1; }
+now() { date -u +%s; }
+
+# "30m", "2h", "90s", "45" -> seconds; fails (return 1) on anything else.
+to_seconds() {
+  local v="${1:-}" n unit
+  case "$v" in ''|*[!0-9smhd]*) err "bad duration: '$v'"; return 1 ;; esac
+  n=$(printf '%s' "$v" | sed 's/[^0-9]//g'); unit=$(printf '%s' "$v" | sed 's/[0-9]//g')
+  [ -n "$n" ] || { err "bad duration: '$v'"; return 1; }
+  case "$unit" in
+    ''|s) echo "$n" ;;
+    m) echo $((n * 60)) ;;
+    h) echo $((n * 3600)) ;;
+    d) echo $((n * 86400)) ;;
+    *) err "bad duration unit: '$v'"; return 1 ;;
+  esac
+}
+
+# A resource name: letters, digits, : . _ - only, not starting with a dot. Fails otherwise.
+res_dir() {
+  local r="${1:-}"
+  case "$r" in ''|.*|*[!A-Za-z0-9:._-]*) err "bad resource name: '$r' (letters, digits, : . _ - only; use - instead of a space)"; return 1 ;; esac
+  printf '%s/%s' "$LOCKS" "$r"
+}
+
+proc_name() { ps -o comm= -p "$1" 2>/dev/null | sed 's#.*/##'; }
+proc_alive() { kill -0 "$1" 2>/dev/null; }
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }   # GNU first: BSD stat has no -c, GNU -f means filesystem
+oneline() { printf '%s' "$1" | tr -d '\n\r'; }
+
+# The nearest ancestor that is Claude Code (claude, or node for the npm install).
+anchor_pid() {
+  local pid=$$ name hops=0
+  while [ "$pid" -gt 1 ] && [ $hops -lt 30 ]; do
+    name=$(proc_name "$pid")
+    case "$name" in *claude*|node) echo "$pid"; return 0 ;; esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -n "$pid" ] || break
+    hops=$((hops + 1))
+  done
+  echo "$PPID"
+}
+
+session_id() {
+  if [ -n "${AGENTLOCK_OWNER:-}" ]; then printf '%s' "$AGENTLOCK_OWNER"; else printf 'pid:%s' "$(anchor_pid)"; fi
+}
+owner_id() {
+  local base; base=$(session_id)
+  if [ -n "${AGENTLOCK_AS:-}" ]; then printf '%s:%s' "$base" "$(oneline "$AGENTLOCK_AS")"; else printf '%s' "$base"; fi
+}
+
+info_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+
+# True if the lock belongs to this exact owner.
+held_by_me() { [ -f "$1/info" ] && [ "$(info_get "$1/info" owner)" = "$(owner_id)" ]; }
+# True if the lock belongs to this session or one of its sub-owners.
+held_by_my_session() {
+  local o base; [ -f "$1/info" ] || return 1
+  o=$(info_get "$1/info" owner); base=$(session_id)
+  [ "$o" = "$base" ] && return 0
+  case "$o" in "$base:"*) return 0 ;; esac
+  return 1
+}
+
+is_stale() {  # $1 = lock dir
+  local info="$1/info" pid exp
+  [ -d "$1" ] || return 1
+  if [ ! -f "$info" ]; then
+    # Being written, or abandoned between mkdir and write: stale only after the grace period.
+    [ $(( $(now) - $(mtime "$1") )) -gt $WRITE_GRACE ]; return
+  fi
+  pid=$(info_get "$info" pid); exp=$(info_get "$info" expires)
+  if [ -n "$pid" ] && ! proc_alive "$pid"; then return 0; fi
+  if [ -n "$exp" ] && [ "$exp" != 0 ] && [ "$(now)" -gt "$exp" ]; then return 0; fi
+  return 1
+}
+
+describe() {  # $1 = lock dir
+  local info="$1/info" age exp left
+  [ -f "$info" ] || { echo "(being written)"; return; }
+  age=$(( $(now) - $(info_get "$info" acquired) ))
+  exp=$(info_get "$info" expires)
+  if [ "$exp" = 0 ]; then left="no ttl"; else left="$(( exp - $(now) ))s left"; fi
+  printf 'owner=%s pid=%s age=%ss %s project=%s reason=%s' \
+    "$(info_get "$info" owner)" "$(info_get "$info" pid)" "$age" "$left" \
+    "$(info_get "$info" project)" "$(info_get "$info" reason)"
+}
+
+# A wait that outlives the shell that started it (a subagent that returned, a Bash call that ended) would sit
+# on the lock queue for its whole limit; so each poll checks that the parent is still the one we started under.
+START_PPID=$PPID   # bash's own value, no fork; the per-poll check below asks ps
+# A process that only collects orphans: init, launchd, systemd (also as a user session's subreaper), a
+# container's init. A wait whose parent is one of these belongs to no live call. Pid 1 itself is such a
+# process unless it is a shell (a container started as `bash script.sh`), in which case it is a live parent.
+is_reaper() {   # $1 = pid
+  local c; c=$(proc_name "$1")
+  case "$c" in
+    '') return 1 ;;   # ps answered nothing: unknown, not a reaper (the same rule as poll_sleep's empty ppid)
+    init|launchd|systemd|process_api|tini|dumb-init|runit|s6-svscan|upstart|runsvdir|openrc-init) return 0 ;;
+    sh|bash|zsh|dash|ksh|fish) return 1 ;;
+  esac
+  [ "$1" = 1 ]
+}
+poll_sleep() {
+  local p; p=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
+  [ -n "$p" ] || { sleep "$POLL_SECONDS"; return; }   # ps failed (a fork refused on a loaded machine): unknown, not gone
+  # A wait started detached (`( … & )`) is reparented to init or a subreaper before its first poll, often
+  # before bash even read $PPID, so the pid may never change: ask what the parent is, not only which.
+  if is_reaper "$p"; then
+    if [ "$p" = "$START_PPID" ]; then die "this wait has no shell to belong to (started detached); giving up"
+    else die "the shell that started this wait is gone; giving up"; fi
+  fi
+  [ "$p" = "$START_PPID" ] || die "the shell that started this wait is gone; giving up"
+  sleep "$POLL_SECONDS"
+}
+# Extend a held lock's expiry by its original ttl: the guard does this on every guarded command, so a batch of
+# test runs keeps its lock as long as commands keep coming (a 60-minute ttl once ran out mid-batch and two
+# builders overlapped on one simulator).
+lock_ttl() {  # $1 = lock dir: the ttl the lock was taken with (its own field; for older info files, expires minus acquired)
+  local info="$1/info" ttl acq exp
+  ttl=$(info_get "$info" ttl)
+  case "$ttl" in ''|*[!0-9]*)
+    acq=$(info_get "$info" acquired); exp=$(info_get "$info" expires)
+    case "$exp" in ''|*[!0-9]*) echo 0; return ;; esac   # each value checked on its own: an empty acquired is not a zero
+    case "$acq" in ''|*[!0-9]*) echo 0; return ;; esac
+    [ "$exp" = 0 ] && { echo 0; return; }
+    ttl=$(( exp - acq )) ;;
+  esac
+  [ "$ttl" -le 31536000 ] 2>/dev/null || ttl=0   # a ttl over a year is a malformed file, not a plan
+  echo "$ttl"
+}
+refresh_lock() {  # $1 = lock dir, $2 = "now" to refresh even in the last seconds (renew, which has just checked the holder)
+  local info="$1/info" content ttl exp acq t
+  [ -f "$info" ] || return 0
+  # One read of the file, and everything derived from that copy: a second read could see another party's content
+  # (a waiter's takeover) and the write would then land on their lock.
+  content=$(cat "$info" 2>/dev/null) || return 0
+  ttl=$(printf '%s\n' "$content" | sed -n 's/^ttl=//p' | head -1)
+  exp=$(printf '%s\n' "$content" | sed -n 's/^expires=//p' | head -1)
+  acq=$(printf '%s\n' "$content" | sed -n 's/^acquired=//p' | head -1)
+  case "$exp" in ''|0|*[!0-9]*) return 0 ;; esac
+  case "$ttl" in ''|*[!0-9]*) case "$acq" in ''|*[!0-9]*) return 0 ;; esac; ttl=$(( exp - acq )) ;; esac
+  [ "$ttl" -gt 0 ] 2>/dev/null && [ "$ttl" -le 31536000 ] || return 0
+  # A lock in its last seconds is left to expire as it would have: a waiter may be taking it over right now, and a
+  # takeover needs a stale lock, so one with a few seconds left cannot change hands during this refresh.
+  t=$(now); [ "${2:-}" = now ] || [ $(( exp - t )) -gt 5 ] || return 0
+  printf '%s\n' "$content" | sed "s/^expires=.*/expires=$(( t + ttl ))/" > "$info.refresh.$$" 2>/dev/null && mv "$info.refresh.$$" "$info" 2>/dev/null || rm -f "$info.refresh.$$" 2>/dev/null
+}
+write_info() {  # $1 = lock dir, $2 = ttl seconds (numeric), $3 = reason; fails if it cannot write
+  local exp=0
+  case "$2" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$2" -gt 0 ] && exp=$(( $(now) + $2 ))
+  {
+    echo "owner=$(owner_id)"
+    echo "pid=$(anchor_pid)"
+    echo "project=$(oneline "$PWD")"
+    echo "reason=$(oneline "$3")"
+    echo "acquired=$(now)"
+    echo "ttl=$2"
+    echo "expires=$exp"
+    echo "host=$(hostname)"
+  } > "$1/info.tmp" 2>/dev/null && mv "$1/info.tmp" "$1/info" 2>/dev/null
+}
+
+remove_lock() { [ -d "$1" ] && rm -rf "$1"; }   # only ever a directory
+
+# Prints the quiet lock's dir if another party holds a live "quiet" lock.
+# Prints the quiet lock's dir if a live "quiet" is held by anyone but this exact owner. Per owner, not per
+# session: a builder's timing measurement is spoiled by its sibling's test run as much as by another session's
+# (five overlaps in one shift of the first project), and the guard, which cannot tell whose command it sees, blocks every
+# heavy command of the session while a builder holds quiet; the measuring builder runs its own through
+# `AGENTLOCK_AS=<name> agentlock with quiet -- <command>`, which the guard lets through.
+quiet_by_other() {
+  local d
+  for d in "$LOCKS/quiet" "$LOCK_ROOT/quiet"; do
+    [ -f "$d/info" ] && ! held_by_me "$d" && ! is_stale "$d" && { echo "$d"; return 0; }
+  done
+  return 1
+}
+# Lists live locks held by other owners (for taking "quiet"), legacy ones included. Per owner, like quiet_by_other:
+# a builder's quiet waits for its siblings' locks as it does for another session's (0.4.14).
+others_live() {
+  local d
+  for d in "$LOCKS"/*/ "$LOCK_ROOT"/*/; do
+    # A bare legacy directory counts here as it does for acquire: busy through the grace period, then ignored.
+    is_lock_dir "${d%/}" || { [ -d "$d" ] && [ "$(basename "$d")" != locks ] && [ ! -f "$d/info" ]; } || continue
+    held_by_me "${d%/}" && continue
+    is_stale "${d%/}" && continue
+    basename "$d"
+  done | sort -u
+}
+# Copies before 0.4.0 kept locks directly under $LOCK_ROOT, and a session started before the
+# update keeps its old copy until it restarts. Those locks are honoured here (never taken over
+# while live), so the two layouts exclude each other in that direction; the old copy cannot see
+# this layout, so the release notes ask for every session to restart. Only directories with an
+# info file count: $LOCK_ROOT also holds locks/, guard.conf and the wrapper.
+is_lock_dir() {  # a directory under locks/, or a legacy directory with an info file (paths may hold spaces: no lists)
+  case "$1" in
+    "$LOCKS"/*) [ -d "$1" ] ;;
+    *) [ -f "$1/info" ] && [ "$(basename "$1")" != locks ] ;;
+  esac
+}
+# For a named resource any directory counts, info file or not: the old copy's mkdir comes before
+# its write, and is_stale's grace period covers that window as it does for the new layout.
+legacy_dir() { [ "$1" != locks ] && [ -d "$LOCK_ROOT/$1" ] && printf '%s' "$LOCK_ROOT/$1"; }
+
+cmd_acquire() {
+  local res="" ttl="$DEFAULT_TTL" reason="" wait="" quiet=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ttl) ttl="${2:-}"; [ -n "$ttl" ] || die "--ttl needs a value"; shift 2 ;;
+      --reason) reason="${2:-}"; shift 2 ;;
+      --wait) case "${2:-}" in ''|-*) wait="$WAIT_DEFAULT"; shift ;; *) wait="$2"; shift 2 ;; esac ;;   # a bare --wait once read the next option as its value and failed as "one resource per call"
+      --quiet|-q) quiet=1; shift ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$res" ] && res="$1" || die "one resource per call"; shift ;;
+    esac
+  done
+  [ -n "$res" ] || die "usage: agentlock acquire <resource> [--ttl 30m] [--reason ...] [--wait [10m]]"
+  local dir ttl_s deadline=0 retried=""
+  dir=$(res_dir "$res") || exit 1
+  ttl_s=$(to_seconds "$ttl") || exit 1
+  # One clock read: two reads around a second boundary made a 1 s wait end before it began (a suite flake).
+  if [ -n "$wait" ]; then local ws; ws=$(to_seconds "$wait") || exit 1; [ "$ws" -gt 0 ] || exit 1; deadline=$(( $(now) + ws )); fi
+  mkdir -p "$LOCKS" || die "cannot create $LOCKS"
+  # Versions before 0.4.0 kept locks directly under $LOCK_ROOT and treated any directory there
+  # without an info file as stale: their `clean` would delete locks/ with every live lock in it.
+  # A marker with no pid and no expiry is never stale to the old binary (a pid such as 1 would
+  # not do: kill -0 on a root process fails for a normal user), so it leaves locks/ alone;
+  # this version skips the file, since only directories under locks/ are locks. (install-mac.sh
+  # writes the same marker after migrating old locks; keep the two in step.)
+  [ -e "$LOCKS/info" ] || printf 'owner=agentlock-0.4.0-marker\nacquired=%s\nexpires=0\nreason=not-a-lock\n' "$(now)" > "$LOCKS/info" 2>/dev/null || true
+  if [ -e "$dir" ] && [ ! -d "$dir" ]; then die "$dir exists and is not a lock"; fi
+  while :; do
+    # While another party holds "quiet", nothing else is handed out.
+    local q; q=$(quiet_by_other)
+    if [ -n "$q" ] && [ "$res" != quiet ]; then
+      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then poll_sleep; continue; fi
+      printf 'agentlock: machine is quiet for a measurement: %s\n' "$(describe "$q")" >&2
+      return 1
+    fi
+    # "quiet" waits until no other party holds anything.
+    if [ "$res" = quiet ]; then
+      local busy; busy=$(others_live | tr '\n' ' ')
+      if [ -n "$busy" ]; then
+        if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then poll_sleep; continue; fi
+        printf 'agentlock: cannot take quiet, others hold: %s\n' "$busy" >&2
+        return 1
+      fi
+    fi
+    local lg; lg=$(legacy_dir "$res" || true)
+    if [ -n "$lg" ] && ! held_by_my_session "$lg" && ! is_stale "$lg"; then
+      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then poll_sleep; continue; fi
+      printf 'agentlock: %s is busy, held through a pre-0.4.0 copy (that session has not restarted): %s\n' "$res" "$(describe "$lg")" >&2
+      return 1
+    fi
+    if mkdir "$dir" 2>/dev/null; then
+      # An old copy may have made its directory between the check above and this mkdir: look again and back off.
+      lg=$(legacy_dir "$res" || true)
+      if [ -n "$lg" ] && ! held_by_my_session "$lg" && ! is_stale "$lg"; then rmdir "$dir" 2>/dev/null; continue; fi
+      if write_info "$dir" "$ttl_s" "$reason"; then
+        [ -z "$quiet" ] && echo "acquired $res ($(owner_id), ttl ${ttl_s}s)"
+        return 0
+      fi
+      rmdir "$dir" 2>/dev/null; die "could not write $dir/info"
+    fi
+    if [ ! -d "$dir" ]; then   # mkdir failed and the dir is not there: it vanished (retry once) or mkdir cannot work here
+      [ -z "$retried" ] || die "cannot create $dir (name too long, no permission, disk full?)"
+      retried=1; continue
+    fi
+    if held_by_me "$dir"; then
+      write_info "$dir" "$ttl_s" "${reason:-$(info_get "$dir/info" reason)}" || die "could not refresh $dir/info"
+      [ -z "$quiet" ] && echo "already held $res, ttl refreshed to ${ttl_s}s"
+      return 0
+    fi
+    if is_stale "$dir"; then
+      [ -z "$quiet" ] && echo "removing stale lock on $res: $(describe "$dir")" >&2
+      remove_lock "$dir"
+      continue
+    fi
+    if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then
+      poll_sleep; continue
+    fi
+    printf 'agentlock: %s is busy: %s\n' "$res" "$(describe "$dir")" >&2
+    return 1
+  done
+}
+
+cmd_renew() {   # renew <resource> [--ttl X]: a held lock's expiry moves out by its own ttl, or by --ttl
+  local res="" ttl=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ttl) ttl="${2:-}"; [ -n "$ttl" ] || die "--ttl needs a value"; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$res" ] && res="$1" || die "one resource per call"; shift ;;
+    esac
+  done
+  [ -n "$res" ] || die "usage: agentlock renew <resource> [--ttl 30m]"
+  local dir; dir=$(res_dir "$res") || exit 1
+  [ -d "$dir" ] && ! is_stale "$dir" || { echo "not held: $res (renew only refreshes a lock you hold; acquire takes one)" >&2; return 1; }
+  held_by_me "$dir" || { printf 'agentlock: %s is held by someone else: %s\n' "$res" "$(describe "$dir")" >&2; return 1; }
+  if [ -n "$ttl" ]; then
+    local ttl_s exp; ttl_s=$(to_seconds "$ttl") || exit 1
+    if [ "$ttl_s" -gt 0 ]; then exp=$(( $(now) + ttl_s )); else exp=0; fi   # --ttl 0 means no expiry, as on acquire
+    sed "s/^ttl=.*/ttl=$ttl_s/; s/^expires=.*/expires=$exp/" "$dir/info" > "$dir/info.refresh.$$" 2>/dev/null && mv "$dir/info.refresh.$$" "$dir/info" || { rm -f "$dir/info.refresh.$$"; die "could not write $dir/info"; }
+    grep -q '^ttl=' "$dir/info" || printf 'ttl=%s\n' "$ttl_s" >> "$dir/info"
+  else
+    [ "$(lock_ttl "$dir")" -gt 0 ] 2>/dev/null || { echo "$res has no ttl; nothing to renew"; return 0; }
+    refresh_lock "$dir" now   # held_by_me and not stale were just checked, so no takeover can land during this write
+  fi
+  echo "renewed $res ($(describe "$dir"))"
+}
+
+cmd_release() {
+  local res="" force=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) res="$1"; shift ;;
+    esac
+  done
+  [ -n "$res" ] || die "usage: agentlock release <resource> [--force]"
+  local dir lg; dir=$(res_dir "$res") || exit 1
+  lg=$(legacy_dir "$res" || true)
+  # A lock an old copy holds can be released here too (the old session then finds it gone, as after its
+  # own clean), but only a directory with an info file is a lock: a bare directory under the root is
+  # never deleted here, whatever its age or the flags.
+  [ -n "$lg" ] && [ ! -f "$lg/info" ] && lg=""
+  if [ ! -d "$dir" ] && [ -n "$lg" ]; then
+    if held_by_my_session "$lg" || [ -n "$force" ] || is_stale "$lg"; then remove_lock "$lg" && echo "released $res (held through a pre-0.4.0 copy)"; return 0; fi
+    printf 'agentlock: %s is held through a pre-0.4.0 copy: %s (release --force removes it)\n' "$res" "$(describe "$lg")" >&2; return 1
+  fi
+  [ -d "$dir" ] || { echo "not held: $res"; return 0; }
+  if held_by_me "$dir" || [ -n "$force" ] || is_stale "$dir"; then
+    remove_lock "$dir" && echo "released $res"
+    [ -n "$force" ] && [ -n "$lg" ] && remove_lock "$lg" && echo "released the pre-0.4.0 copy's $res as well"
+    return 0
+  else
+    printf 'agentlock: %s is held by someone else: %s\n' "$res" "$(describe "$dir")" >&2
+    return 1
+  fi
+}
+
+cmd_release_all() {
+  local d n=0
+  [ -d "$LOCKS" ] || return 0
+  for d in "$LOCKS"/*/; do
+    [ -d "$d" ] || continue
+    if held_by_me "${d%/}" || { [ -z "${AGENTLOCK_AS:-}" ] && held_by_my_session "${d%/}"; }; then
+      remove_lock "${d%/}"; n=$((n + 1)); echo "released $(basename "$d")"
+    fi
+  done
+  [ $n -eq 0 ] && echo "nothing held by $(owner_id)"
+  return 0
+}
+
+WITH_RES=""; WITH_OWNED=""
+cmd_with() {
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift; break ;;
+      --ttl|--reason) [ $# -ge 2 ] || die "$1 needs a value"; args+=("$1" "$2"); shift 2 ;;
+      --wait) case "${2:-}" in ''|-*) args+=("$1" "$WAIT_DEFAULT"); shift ;; *) args+=("$1" "$2"); shift 2 ;; esac ;;
+      -*) args+=("$1"); shift ;;
+      *) [ -z "$WITH_RES" ] && WITH_RES="$1"; args+=("$1"); shift ;;
+    esac
+  done
+  [ $# -gt 0 ] && [ -n "$WITH_RES" ] || die "usage: agentlock with <resource> [opts] -- <command...>"
+  if cmd_check "$WITH_RES" 2>/dev/null; then WITH_OWNED=1; fi   # already ours: leave it as it is, do not release it afterwards
+  if [ -n "$WITH_OWNED" ]; then
+    # A resource taken before someone else's quiet began gives no right to run under the measurement (a quiet waits
+    # for every other lock, so this is a race or an expiry, not the normal path); the holder's own `with quiet` passes.
+    local q; q=$(quiet_by_other)
+    if [ -n "$q" ] && [ "$WITH_RES" != quiet ]; then printf 'agentlock: machine is quiet for a measurement: %s\n' "$(describe "$q")" >&2; return 1; fi
+    # The holder is using the lock now: push its expiry out by its TTL (the guard does not do this for quiet, since
+    # under quiet it cannot tell the measurer's command from a sibling's, and `with quiet` is how the measurer runs).
+    refresh_lock "$(res_dir "$WITH_RES")" now
+  else
+    cmd_acquire ${args[@]+"${args[@]}"} --quiet || return 1
+    trap 'cmd_release "$WITH_RES" >/dev/null' EXIT INT TERM
+  fi
+  "$@"
+}
+
+cmd_wait() {
+  [ -n "${1:-}" ] || die "usage: agentlock wait <resource> [timeout]"
+  local dir deadline=0; dir=$(res_dir "$1") || exit 1
+  if [ -n "${2:-}" ]; then local ws; ws=$(to_seconds "$2") || exit 1; [ "$ws" -gt 0 ] || exit 1; deadline=$(( $(now) + ws )); fi
+  local lg holder
+  while :; do
+    lg=$(legacy_dir "$1" || true)
+    if [ -d "$dir" ] && ! is_stale "$dir" && ! held_by_me "$dir"; then holder="$dir"
+    elif [ -n "$lg" ] && ! is_stale "$lg" && ! held_by_my_session "$lg"; then holder="$lg"
+    else break; fi
+    if [ "$deadline" -gt 0 ] && [ "$(now)" -ge "$deadline" ]; then echo "still held: $(describe "$holder")" >&2; return 1; fi
+    poll_sleep
+  done
+  echo "$1 is free"
+}
+
+cmd_check() {
+  [ -n "${1:-}" ] || die "usage: agentlock check <resource>"
+  local dir; dir=$(res_dir "$1") || return 1
+  [ -d "$dir" ] && held_by_me "$dir" && ! is_stale "$dir"
+}
+cmd_free() {   # exit 0 when nobody else holds <resource> live (free, stale, or mine); 1 when someone else does. `status` is a report and exits 0 either way.
+  [ -n "${1:-}" ] || die "usage: agentlock free <resource>"
+  local dir lg; dir=$(res_dir "$1") || return 1
+  if [ -d "$dir" ] && ! is_stale "$dir" && ! held_by_me "$dir"; then return 1; fi
+  lg=$(legacy_dir "$1" || true)
+  if [ -n "$lg" ] && ! is_stale "$lg" && ! held_by_my_session "$lg"; then return 1; fi
+  return 0
+}
+
+# True if this owner (or, in guard mode, this session) holds <name> or any <name>:* lock.
+GUARD_MODE=""
+holds_family() {
+  local base="$1" d held=""
+  for d in "$LOCKS/$base/" "$LOCKS/$base":*/; do
+    [ -d "$d" ] || continue
+    is_stale "${d%/}" && continue
+    if [ -n "$GUARD_MODE" ]; then
+      # Every live family lock the session holds is refreshed, not the first found: the guard cannot tell
+      # which builder's command this is, and two builders on two simulators each need theirs kept.
+      held_by_my_session "${d%/}" && { refresh_lock "${d%/}"; held=1; }
+    else held_by_me "${d%/}" && return 0; fi
+  done
+  [ -n "${held:-}" ]
+}
+
+cmd_status() {
+  local d flag
+  [ -d "$LOCK_ROOT" ] || { echo "no locks"; return 0; }
+  if [ -n "${1:-}" ]; then
+    d=$(res_dir "$1") || exit 1
+    if [ ! -d "$d" ]; then d=$(legacy_dir "$1" || true); flag=" [pre-0.4.0 copy]"; else flag=""; fi
+    [ -n "$d" ] && [ -d "$d" ] || { echo "$1: free"; return 0; }
+    is_stale "$d" && flag="$flag [STALE]"
+    echo "$1: $(describe "$d")$flag"; return 0
+  fi
+  local any=""
+  for d in "$LOCKS"/*/; do
+    [ -d "$d" ] || continue
+    any=1; flag=""; is_stale "${d%/}" && flag=" [STALE]"
+    held_by_me "${d%/}" && flag="$flag [mine]"
+    echo "$(basename "$d"): $(describe "${d%/}")$flag"
+  done
+  for d in "$LOCK_ROOT"/*/; do
+    is_lock_dir "${d%/}" || continue
+    any=1; flag=""; is_stale "${d%/}" && flag=" [STALE]"
+    echo "$(basename "$d"): $(describe "${d%/}") [pre-0.4.0 copy]$flag"
+  done
+  [ -z "$any" ] && echo "no locks"
+  return 0
+}
+
+cmd_clean() {
+  local d
+  [ -d "$LOCK_ROOT" ] || return 0
+  for d in "$LOCKS"/*/ "$LOCK_ROOT"/*/; do
+    is_lock_dir "${d%/}" || continue
+    if is_stale "${d%/}"; then echo "removing stale $(basename "$d")"; remove_lock "${d%/}"; fi
+  done
+}
+
+# Validate guard.conf: a tab between resource and regex, and a regex grep -E accepts.
+cmd_check_conf() {
+  local conf="$LOCK_ROOT/guard.conf" res re n=0 bad=0
+  [ -f "$conf" ] || { echo "no $conf (the guard then allows everything)"; return 1; }
+  while IFS=$'\t' read -r res re || [ -n "$res" ]; do
+    n=$((n + 1))
+    case "$res" in ''|\#*) continue ;; esac
+    if [ -z "$re" ]; then echo "line $n: no tab between resource and regex: $res" >&2; bad=1; continue; fi
+    printf 'x' | grep -E -- "$re" >/dev/null 2>&1; local rc=$?
+    if [ $rc -eq 2 ]; then echo "line $n ($res): bad regex: $re" >&2; bad=1; fi
+  done < "$conf"
+  [ $bad -eq 0 ] && echo "guard.conf ok" || return 1
+}
+
+# Claude Code PreToolUse hook for the Bash tool.
+# Reads the hook JSON on stdin, extracts the command, blanks heredoc bodies and all but
+# the first word of each quoted string, matches it against $AGENTLOCK_DIR/guard.conf
+# (lines: "<resource>\t<extended regex>"), and blocks (exit 2) when a matched resource
+# is not held by this session. A command whose first word is agentlock always passes.
+# A rule that is not a valid regex blocks with a message, rather than silently allowing.
+cmd_guard() {
+  local conf="$LOCK_ROOT/guard.conf" input cmd sid first raw bg
+  input=$(cat)
+  # The command as written, and the background flag, for the two built-in rules below.
+  if command -v python3 >/dev/null 2>&1; then
+    raw=$(printf '%s' "$input" | python3 -I -c 'import json,sys; c=json.load(sys.stdin).get("tool_input",{}).get("command",""); print(c if isinstance(c,str) else "")' 2>/dev/null)
+    bg=$(printf '%s' "$input" | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("tool_input",{}).get("run_in_background", False))' 2>/dev/null)
+  elif command -v jq >/dev/null 2>&1; then
+    raw=$(printf '%s' "$input" | jq -r '.tool_input.command // "" | strings')
+    bg=$(printf '%s' "$input" | jq -r '.tool_input.run_in_background // false')
+  else
+    exit 0
+  fi
+  # Two rules that need no lock and no config file, so they hold on a machine without guard.conf too, because
+  # each has cost shifts hours (the first project's shifts 3 to 6): a watcher started with & in a plain call cannot wake
+  # the session and outlives it; a wait loop on pgrep can match the shell running the loop and never ends.
+  # They read the command as written (quoted or not, on any line), not the preprocessed form the config rules
+  # see, so `until [ -z "$(pgrep -f x)" ]` and a multi-line loop are caught; commands that only read, print or
+  # tidy (grep, echo, ps, pkill, sleep, mkdir, tee ...) are left alone, but only when every command in the line
+  # is one of those: `echo start; ( python3 … --role … & )` is a watcher start. The threat is a slip, not an
+  # adversary: `--rol` (argparse prefixes) or a `--once` in a comment would get past, and that is accepted.
+  local folded joined all_ro=1 seg w rawsegs
+  folded=$(printf '%s' "$raw" | tr '\n' ' ')
+  # Segments: backslash-continued lines are joined, then a newline separates like `;` (a start on the second line of
+  # a call is a start, whatever the first line was), and so do ||, &&, ;, | and a lone & (computed here from the raw
+  # text: the preprocessed form would have eaten a backslash-newline inside a heredoc).
+  # A newline inside quotes is text (a commit message or an issue body may quote the start command on its own
+  # line), so those are folded to spaces first, with the quoting rules of bash (a backslash escapes outside and in
+  # double quotes, nothing does in single quotes, a comment runs to its newline), and a heredoc body is text too
+  # (a README written with `cat <<EOF` quotes the start command at column 0): its lines are blanked up to the
+  # terminator, as the config rules' preprocessing does. An unterminated heredoc blanks to the end.
+  joined=$(printf '%s' "$raw" | sed -e ':a' -e '/\\$/{' -e '$b' -e 'N' -e 's/\\\n[[:space:]]*/ /' -e 'ba' -e '}' | awk 'BEGIN { RS = "\001" } {
+    n = length($0); q = ""; out = ""; prev = "\n"; np = 0
+    for (i = 1; i <= n; i++) {
+      c = substr($0, i, 1)
+      if (q == "\047") { if (c == "\047") q = ""; else if (c == "\n") c = " " }
+      else if (q == "\"") { if (c == "\\") { out = out c; i++; c = substr($0, i, 1) } else if (c == "\"") q = ""; else if (c == "\n") c = " " }
+      else if (c == "\\") { out = out c; i++; c = substr($0, i, 1) }
+      else if (c == "#" && prev ~ /[ \t\n;|&(]/) { while (i <= n && substr($0, i, 1) != "\n") { out = out substr($0, i, 1); i++ }; c = "\n" }
+      else if (c == "\"" || c == "\047") q = c
+      else if (c == "<" && prev != "<" && prev !~ /[0-9)]/ && substr($0, i + 1, 1) == "<" && substr($0, i + 2, 1) != "<") {
+        # a heredoc opener, <<[-][quote]WORD[quote]: remember the terminator for the end of this line (not a
+        # here-string <<<, seen from either of its first two <, and not a shift in arithmetic, 1<<2)
+        j = i + 2; dash = 0; if (substr($0, j, 1) == "-") { dash = 1; j++ }
+        while (substr($0, j, 1) ~ /[ \t]/) j++
+        qc = substr($0, j, 1); if (qc == "\047" || qc == "\"" || qc == "\\") j++
+        w = ""; while (j <= n && substr($0, j, 1) ~ /[A-Za-z0-9_]/) { w = w substr($0, j, 1); j++ }
+        if ((qc == "\047" || qc == "\"") && substr($0, j, 1) == qc) j++   # the closing quote belongs to the delimiter, not to a quote run
+        if (w != "") { np++; pend[np] = w; pdash[np] = dash }
+        out = out substr($0, i, j - i); prev = substr($0, j - 1, 1); i = j - 1; continue
+      }
+      if (c == "\n" && q == "" && np > 0) {
+        out = out c; prev = c; k = 1
+        while (k <= np && i < n) {
+          e = index(substr($0, i + 1), "\n"); line = (e ? substr($0, i + 1, e - 1) : substr($0, i + 1))
+          t = line; if (pdash[k]) sub(/^\t+/, "", t)
+          if (t == pend[k]) k++
+          i += (e ? e : length(line)); out = out "\n"
+        }
+        np = 0; continue
+      }
+      out = out c; prev = c
+    }
+    printf "%s", out }')
+  rawsegs=$(printf '%s' "$joined" | sed -E 's/\|\||&&|;|\|/\
+/g; s/([^<>&])&([^>&])/\1\
+\2/g; s/([^<>&])&$/\1\
+/')
+  while IFS= read -r seg; do
+    [ -n "$(printf '%s' "$seg" | tr -d '[:space:]()')" ] || continue
+    w=$(printf '%s' "$seg" | sed -E 's/^[[:space:]]*[(]*[[:space:]]*(((env|nohup|time|exec|caffeinate)([[:space:]]+-[A-Za-z]+)*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)[[:space:]]+)*//' | awk '{print $1}'); w="${w##*/}"
+    case "$w" in grep|egrep|rg|echo|printf|cat|sed|awk|head|tail|less|more|wc|ls|ps|pgrep|pkill|kill|git|gh|cd|sleep|mkdir|tee|true|test|\[|rm|touch|cp|mv|date|sort|uniq|cut|tr|basename|dirname|find) ;; *) all_ro=""; break ;; esac
+  done <<RAWSEGS
+$rawsegs
+RAWSEGS
+  if [ -z "$all_ro" ]; then
+    # A start of the watcher, not a mention of it: the script's path (quoted or not) at the command position of a
+    # segment, after wrapper words (nohup, env, caffeinate, setsid …), VAR=value prefixes, do/then/else, a shell's -c
+    # string or eval's argument, and an optional python (with options) or `uv run`. A `pgrep -f "watch-github.py …"`
+    # in a kill loop, a grep or a sed on the file are mentions. (Real quote characters: `\x27` means nothing to grep.)
+    local ws="" s
+    while IFS= read -r seg; do
+      s=$(printf '%s' "$seg" | sed -E "s/^[[:space:]]*[({]*[[:space:]]*(((([^[:space:]]*\/)?(env|nohup|time|exec|caffeinate|setsid|sudo|nice|command|stdbuf)|timeout([[:space:]]+-[A-Za-z-]+([[:space:]]+[0-9.]+[smhd]?)?)*[[:space:]]+[0-9.]+[smhd]?|if|elif|while|until|do|then|else|!)([[:space:]]+-[A-Za-z0-9=]+([[:space:]]+[0-9]+)?)*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)[[:space:]]+)*//; s/^(([^[:space:]]*\/)?(ba|z|da|k)?sh[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*c[[:space:]]+|eval[[:space:]]+)[\"']?//")
+      # The path may mix quoted and bare runs ("\$PLUGIN"/scripts/… as well as "\$PLUGIN/scripts/…" and a bare path).
+      if printf '%s' "$s" | grep -Eq "^(uv[[:space:]]+run[[:space:]]+|([^[:space:]]*\/)?python[0-9.]*[[:space:]]+(-[A-Za-z]+[[:space:]]+)*)?(\"[^\"]*\"|'[^']*'|[^[:space:]\"'])*(\"[^\"]*|'[^']*)?watch-github\.py[\"']?[[:space:]]+.*--role" && ! printf '%s' "$s" | grep -Eq -- '--once|--wake'; then ws=1; break; fi
+    done <<RAWSEGS
+$rawsegs
+RAWSEGS
+    if [ -n "$ws" ]; then
+      case "$bg" in True|true) ;; *)
+        echo "Blocked: start the watcher with the Bash tool's run_in_background, not as a plain call and not with &. A watcher started either way cannot wake the session, and one started with & outlives it." >&2; exit 2 ;;
+      esac
+    fi
+    # A wait loop: a while or until loop that runs pgrep anywhere before its done (in the condition or the body,
+    # sleeping or busy), or a for loop that runs pgrep and sleeps (a bounded wait is a wait). A one-shot
+    # `for p in $(pgrep …); do kill $p; done` does not sleep and is a cleanup, not a wait (a shift of the first project was
+    # blocked on exactly that). Each loop is judged on its own, cut at `done`: a TERM loop, a sleep, then a KILL
+    # loop is two cleanups, not one wait. (The cut is a plain word match; a `done` inside a string would split early.)
+    if printf '%s' "$folded" | sed -E 's/(^|[^A-Za-z0-9_])done([^A-Za-z0-9_]|$)/\1\
+\2/g' | grep -Eq '\b(while|until)\b.*\bpgrep\b|\bfor\b.*\bpgrep\b.*\bsleep\b|\bfor\b.*\bsleep\b.*\bpgrep\b'; then
+      echo "Blocked: a wait loop on pgrep can match the shell running the loop itself and never end. Wait on a pid you started: until ! kill -0 \$pid 2>/dev/null; do sleep 3; done. (To stop processes by pattern once, use pkill -f, not a loop.)" >&2; exit 2
+    fi
+  fi
+  [ -f "$conf" ] || exit 0
+  if command -v python3 >/dev/null 2>&1; then
+    cmd=$(printf '%s' "$input" | python3 -I -c '
+import json,sys,re
+c=json.load(sys.stdin).get("tool_input",{}).get("command","")
+if not isinstance(c,str): c=""
+# A heredoc body is data; the rest of its first line (`cat <<EOF | osascript`) is still command.
+# A backslash-continued command is one command: join it first, or `xcodebuild … \\` + `test` on the next line
+# matches no rule. Not inside a heredoc body, where bash keeps a trailing backslash and the terminator still ends
+# the body (a quoted heredoc), so the terminators seen so far are tracked and body lines are left as they are.
+QUOTED = r"\\.|\"((?:[^\"\\]|\\.)*)\"|\$\x27((?:[^\x27\\]|\\.)*)\x27|\x27([^\x27]*)\x27"
+def join_continued(text):
+    out, buf, pending = [], "", []
+    for line in text.split("\n"):
+        if pending:
+            if line.strip() == pending[0]: pending.pop(0)
+            out.append(line); continue
+        trailing = len(line) - len(line.rstrip("\\"))
+        if trailing % 2 == 1:
+            buf += line[:-1] + " "; continue
+        logical = buf + line; buf = ""
+        out.append(logical)
+        # Heredoc openers count on the completed logical line only, and not inside quoted text
+        # (`echo "<<EOF"` opens nothing), or every later line would be taken for a body line. A quoted
+        # delimiter right after << (`<<'EOF'`) is the opener itself and stays.
+        def unquote(m):
+            before = logical[:m.start()].rstrip()
+            return m.group(0) if before.endswith("<<") or before.endswith("<<-") else ""
+        # (?<!<) and (?!<): a here-string `<<< word` is not a heredoc opener.
+        for m in re.finditer(r"(?<!<)<<(?!<)-?\s*\\?([\"\x27]?)(\w+)\1", re.sub(QUOTED, unquote, logical, flags=re.S)): pending.append(m.group(2))
+    if buf: out.append(buf)
+    return "\n".join(out)
+c=join_continued(c)
+c=re.sub(r"<<-?\s*\\?([\"\x27]?)(\w+)\1([^\n]*)\n.*?\n\s*\2(?=\n|$)", lambda m: "<<HEREDOC" + m.group(3), c, flags=re.S)
+# Quoted text is data (issue bodies, commit messages): keep only its first word, cut at any
+# character that would read as a command boundary, so `open -a "Simulator"` still reads as a
+# command, a prose body does not, and `grep -E "foo|osascript"` holds no second command.
+def fw(t):
+    w=t.split()
+    return re.split(r"[|;&()<>]", w[0])[0] if w else ""
+# One pass over both quote kinds, as the shell reads them: two passes let an apostrophe inside
+# double quotes pair with a later single quote and swallow the command between.
+# A backslash escape outside quotes (a backslash before a quote) is consumed as one unit, so it opens no run.
+# Command substitutions run commands, inside double quotes too: `udid="$(xcrun simctl boot …)"`. Each balanced
+# $(…) or `…` span is lifted out and emitted as a statement of its own, ahead of the text it came from (so an
+# unclosed span cannot pair its quote with anything after it), and the place it came from reads SUBST; the quote
+# cut below then sees prose and the rules see the command. One scanner reads quotes as bash does at every level:
+# nothing is special inside '…' until its close; \ escapes inside "…", $'…' and outside quotes; a # at the start
+# of a word runs the comment to the end of the line; $(( … )) is arithmetic, not a substitution.
+def scan(text, i, in_paren):
+    # From i, copy text into out until the end (or, in_paren, the ) that closes depth 0); lift spans into subs.
+    out, subs, q, depth, n = [], [], None, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if q == "\x27":
+            if ch == "\x27": q = None
+            out.append(ch); i += 1; continue
+        if ch == "\\" and i + 1 < n: out.append(text[i:i+2]); i += 2; continue
+        if q == "$\x27":
+            if ch == "\x27": q = None
+            out.append(ch); i += 1; continue
+        if q is None and ch == "#" and (i == 0 or text[i-1] in " \t;(&|)<>\n"):
+            j = text.find("\n", i); j = n if j < 0 else j
+            i = j; continue   # a comment runs nothing: dropped, so `ls # $(xcrun simctl boot X)` is not a tool run
+        if q is None and text.startswith("$\x27", i): q = "$\x27"; out.append("$\x27"); i += 2; continue
+        if q is None and ch == "\x27": q = ch; out.append(ch); i += 1; continue
+        if ch == "\"": q = None if q == "\"" else "\""; out.append(ch); i += 1; continue
+        if text.startswith("$((", i):
+            j, d = i + 3, 2
+            while j < n and d > 0:
+                if text[j] == "(": d += 1
+                elif text[j] == ")": d -= 1
+                j += 1
+            # Arithmetic is not a command, but a substitution nested in it is: scan the content for spans.
+            _, inner_subs, _ = scan(text[i+3:j], 0, False); subs.extend(inner_subs)
+            out.append(text[i:j]); i = j; continue
+        if text.startswith("$(", i):
+            inner, inner_subs, j = scan(text, i + 2, True)
+            subs.extend(inner_subs); subs.append(inner); out.append("SUBST"); i = j; continue
+        if ch == "`":
+            j = i + 1
+            while j < n and text[j] != "`":
+                j += 2 if text[j] == "\\" else 1
+            inner, inner_subs, _ = scan(text[i+1:j], 0, False)   # a span inside the backticks is lifted too
+            subs.extend(inner_subs); subs.append(inner); out.append("SUBST"); i = j + 1; continue
+        if in_paren and q is None:
+            if ch == "(": depth += 1
+            elif ch == ")":
+                if depth == 0: return "".join(out), subs, i + 1
+                depth -= 1
+        out.append(ch); i += 1
+    return "".join(out), subs, n
+outer, lifted, _ = scan(c, 0, False)
+statements = lifted + [outer]
+def cut(m):
+    if m.group(1) is not None: return "\"" + fw(m.group(1)) + "\""
+    if m.group(2) is not None: return "$\x27" + fw(m.group(2)) + "\x27"
+    if m.group(3) is not None: return "\x27" + fw(m.group(3)) + "\x27"
+    return m.group(0)
+# $\x27...\x27 (ANSI-C quoting) takes backslash escapes, a plain single-quoted string takes none;
+# re.S so that a backslash-newline inside quotes is an escape, not the end of the string.
+# Each statement is cut on its own, so an unbalanced quote in one (an unclosed span, a backtick span that ends
+# mid-string) cannot pair with a quote in another and swallow the command between.
+c="\n".join(re.sub(r"\\.|\"((?:[^\"\\]|\\.)*)\"|\$\x27((?:[^\x27\\]|\\.)*)\x27|\x27([^\x27]*)\x27", cut, st, flags=re.S) for st in statements)
+print(c)' 2>/dev/null)
+    sid=$(printf '%s' "$input" | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)
+  elif command -v jq >/dev/null 2>&1; then
+    # Join continued lines, as the python path does (without its heredoc awareness: this path has none anyway).
+    # `$b` leaves the last line alone: BSD sed's N on the last line would quit without printing.
+    cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // "" | strings' | sed -e ':a' -e '/\\$/{' -e '$b' -e 'N' -e 's/\\\n[[:space:]]*/ /' -e 'ba' -e '}')
+    sid=$(printf '%s' "$input" | jq -r '.session_id // ""')
+  else
+    exit 0
+  fi
+  # Preprocessing that fails on a non-empty command (a python error on pathological input) must not open the
+  # door: match the command as written instead, over-inclusive rather than silent.
+  if [ -z "$cmd" ] && [ -n "$raw" ]; then cmd="$raw"; fi
+  [ -n "$cmd" ] || exit 0
+  [ -n "$sid" ] && export AGENTLOCK_OWNER="$sid"
+  GUARD_MODE=1; unset AGENTLOCK_AS
+  # Commands that operate the lock itself pass, but only when every command in the line is one:
+  # `agentlock status; xcrun simctl boot X` is not a lock command. Wrapper words (env, nohup, time,
+  # exec, caffeinate) and VAR=value prefixes are skipped before the first word is read.
+  local all=1 seg segs
+  segs=$(printf '%s' "$cmd" | sed -E 's/\|\||&&|;|\|/\
+/g; s/([^<>&])&([^>&])/\1\
+\2/g; s/([^<>&])&$/\1\
+/')
+  while IFS= read -r seg; do
+    [ -n "$(printf '%s' "$seg" | tr -d '[:space:]')" ] || continue
+    first=$(printf '%s' "$seg" | sed -E 's/^[[:space:]]*(((env|nohup|time|exec|caffeinate)([[:space:]]+-[A-Za-z]+)*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)[[:space:]]+)*//' | awk '{print $1}')
+    case "${first##*/}" in agentlock) ;; *) all=""; break ;; esac
+  done <<SEGS
+$segs
+SEGS
+  [ -n "$all" ] && exit 0
+  # The config rules are matched per statement (split on ;, ||, a lone & and newlines), and within a statement
+  # only against the segments that run something: a `grep -E "devicectl|simctl"` or an `echo` is text about
+  # tools, not a tool (the first project's shift 7 was blocked for a `ps | grep` naming devicectl). A segment that holds a
+  # command substitution ($(…), a backtick, <(…), >(…)) runs something and stays; every segment stays when one
+  # of them evaluates text as commands (sh, bash, eval, xargs, find, source). ($(…) and backtick spans are
+  # lifted out as statements of their own before this point; the substitution check below is a safety net.)
+  # `agentlock acquire X … && <command>` takes the lock before the command, and && stops the command when the
+  # acquire fails, so X counts as held for the segments after it in that statement, and no further: `;` and
+  # `||` end the statement and the grant, and a segment before the acquire gets nothing. Parentheses are not
+  # tracked, so `acquire X && (a; b)` grants X to `a` only; take the lock in its own call for such a chain.
+  local keep_all="" w stmts stmt segl marker grants res re missing="" badrule="" q TAB rule_text; q=$(quiet_by_other); TAB=$(printf '\t')
+  # Does a grant cover every match of rule $2 for resource $1? A grant is res@start (acquire: from the acquire on) or
+  # res@start@end (with: to the && that ends its pipe chain). A grant of quiet covers every resource: the measurer
+  # holds the machine. (No head -c when the grant starts at 0: BSD head rejects a byte count of 0.)
+  granted() {
+    local g gs ge; for g in $grants; do case "${g%%@*}" in "$1"|"$1":*|quiet)
+      gs=${g#*@}; ge=${gs#*@}; gs=${gs%%@*}; [ "$ge" != "$gs" ] || ge=""
+      { [ "$gs" = 0 ] || ! printf '%s' "$rule_text" | head -c "$gs" | grep -Eq -- "$2"; } \
+        && { [ -z "$ge" ] || ! printf '%s' "$rule_text" | tail -c "+$((ge + 1))" | grep -Eq -- "$2"; } && return 0 ;;
+    esac; done; return 1
+  }
+  first_word() { printf '%s' "$1" | sed -E 's/^[[:space:]]*[(]*[[:space:]]*(((env|nohup|time|exec|caffeinate|sudo|nice|command)([[:space:]]+-[A-Za-z0-9]+)*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)[[:space:]]+)*//' | awk '{print $1}' | sed 's|.*/||'; }
+  while IFS= read -r seg; do
+    [ -n "$(printf '%s' "$seg" | tr -d '[:space:]()')" ] || continue
+    case "$(first_word "$seg")" in sh|bash|zsh|dash|ksh|eval|xargs|find|source|.) keep_all=1 ;; esac
+  done <<SEGS
+$segs
+SEGS
+  stmts=$(printf '%s' "$cmd" | sed -E 's/\|\|/\
+/g; s/;/\
+/g; s/([^<>&])&([^>&])/\1\
+\2/g; s/([^<>&])&$/\1\
+/')
+  while IFS= read -r stmt; do
+    [ -n "$(printf '%s' "$stmt" | tr -d '[:space:]()')" ] || continue
+    # Segments of this statement, each prefixed by the separator before it (AND for &&, PIPE for |, START).
+    # A real tab in the sed program: \t in a replacement is a GNU extension, and BSD sed would leave the
+    # marker without its tab, so every segment after && or | would read as an empty segment and vanish.
+    segl=$(printf 'START\t%s' "$stmt" | sed -E "s/&&/\\
+AND${TAB}/g; s/\\|/\\
+PIPE${TAB}/g")
+    grants=""; rule_text=""; local pending_grant="" open_with="" ow off
+    while IFS=$'\t' read -r marker seg; do
+      [ -n "$(printf '%s' "$seg" | tr -d '[:space:]()')" ] && {
+        if [ "$marker" = AND ]; then
+          [ -z "$pending_grant" ] || grants="$grants $pending_grant"
+          # `with` releases its resource when its command ends, so its grant ends with the pipe chain, at this &&:
+          # `with X -- a | b && c` grants X to a and b, not to c (unlike acquire, which leaves the lock held).
+          off=$(printf '%s' "$rule_text" | wc -c | tr -d ' '); for ow in $open_with; do grants="$grants $ow@$off"; done; open_with=""
+        fi
+        pending_grant=""
+        w=$(first_word "$seg")
+        if [ "$w" = agentlock ]; then
+          local al_args al_kind al_res; al_args=$(printf '%s' "$seg" | sed -E 's/^[[:space:]]*[(]*[[:space:]]*(((env|nohup|time|exec|caffeinate|sudo|nice|command)([[:space:]]+-[A-Za-z0-9]+)*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)[[:space:]]+)*//')
+          # The resource is the first word after the options (`acquire --ttl 1m sim:x` names sim:x, not --ttl).
+          read -r al_kind al_res <<<"$(printf '%s' "$al_args" | awk '$2 == "acquire" || $2 == "with" { for (i = 3; i <= NF; i++) {
+              if ($i == "--") exit; if ($i == "--ttl" || $i == "--reason") { i++; continue }
+              if ($i == "--wait") { if (i < NF && $(i+1) !~ /^-/) i++; continue }
+              if ($i ~ /^-/) continue; if ($i ~ /^[A-Za-z0-9:._-]+$/) print $2, $i; exit } }')"
+          off=$(printf '%s' "$rule_text" | wc -c | tr -d ' ')
+          case "$al_kind" in
+            acquire) pending_grant="$al_res@$off" ;;
+            # `agentlock with X -- <command> | <filter>`: with takes X before the command, so X is granted from this
+            # segment on (the pipe is what kept the all-agentlock bypass from applying) until the chain's &&.
+            with) open_with="$open_with $al_res@$off" ;;
+          esac
+        fi
+        if [ -z "$keep_all" ]; then
+          case "$seg" in *'$('*|*'`'*|*'<('*|*'>('*) ;; *) case "$w" in grep|egrep|rg|echo|printf|cat|sed|awk|head|tail|less|more|wc|sort|uniq|cut|tr) continue ;; esac ;; esac
+        fi
+        rule_text="$rule_text$seg
+"
+      }
+    done <<SEGL
+$segl
+SEGL
+    for ow in $open_with; do grants="$grants $ow@"; done   # a with whose chain reaches the end of the statement
+    # A grant covers the text after the acquire segment: cut rule_text there for the granted resources' check.
+    while IFS=$'\t' read -r res re || [ -n "$res" ]; do
+      case "$res" in ''|\#*) continue ;; esac
+      [ -n "$re" ] || continue
+      printf '%s' "$rule_text" | grep -Eq -- "$re"; local rc=$?
+      if [ $rc -eq 2 ]; then badrule="$badrule $res"; continue; fi
+      [ $rc -eq 0 ] || continue
+      # Under someone else's quiet only the measurer's own `agentlock with quiet -- <command>` runs, piped or not; the
+      # guard cannot check the name (AGENTLOCK_AS is unset here), the lock does when `with` runs.
+      if [ -n "$q" ] && ! granted quiet "$re"; then
+        {
+          echo "Blocked: the machine is quiet for a measurement, $(describe "$q")."
+          echo "Heavy commands (builds, tests, simulators, devices, screen) wait until it is released or its TTL ends."
+          echo "Do something light meanwhile (reading, writing code, issues), or wait for it: agentlock wait quiet 30m"
+          echo "(If this is the measurement itself, run it as: AGENTLOCK_AS=<your name> agentlock with quiet -- <command>.)"
+        } >&2
+        exit 2
+      fi
+      [ "$res" = heavy ] && continue
+      holds_family quiet && continue   # the machine is this owner's: every resource with it
+      holds_family "$res" && continue
+      # Granted only when every match of the rule lies inside the grant's span: the text before an acquire or a with,
+      # and the text after a with's chain, are checked too.
+      granted "$res" "$re" || missing="$missing $res"
+    done < "$conf"
+  done <<STMTS
+$stmts
+STMTS
+  missing=$(printf '%s' "$missing" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' '); missing="${missing% }"; [ -n "$missing" ] && missing=" $missing"
+  badrule=$(printf '%s' "$badrule" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' '); badrule="${badrule% }"; [ -n "$badrule" ] && badrule=" $badrule"
+  if [ -n "$badrule" ]; then
+    { echo "Blocked: $conf has a rule that is not a valid regex (resource:$badrule). Run 'agentlock check-conf' and fix the file; the guard blocks rather than guesses."; } >&2
+    exit 2
+  fi
+  if [ -n "$missing" ]; then
+    {
+      echo "Blocked: this command needs a lock on:$missing"
+      echo "Take it first, e.g.: agentlock acquire ${missing## } --ttl 30m --reason \"<what you are doing>\""
+      echo "If it is busy, wait with --wait 15m or do something else. Release it when done."
+      case "$cmd" in *\|*) echo "(If this line used 'agentlock with ... -- <command> | ...', the pipe is what tripped the guard: run the command without the pipe, or take the lock first.)" ;; esac
+      echo "(agentlock acquire <resource> ... && <command> on one line also works: the && means the command runs only once the lock is held.)"
+      echo "Current holders:"; cmd_status
+    } >&2
+    exit 2
+  fi
+  exit 0
+}
+
+usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; }
+# The version from the plugin manifest beside this copy: a session loads the plugin once, so a long session may run a
+# copy several releases behind the one installed; the shift reports name it to make that visible.
+cmd_version() {
+  local f; f="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd -P)/.claude-plugin/plugin.json"
+  [ -f "$f" ] || { echo "unknown (no plugin.json beside this copy)"; return 1; }
+  # python3 or jq read the manifest properly; the sed is the last resort for a machine with neither (the guard needs one
+  # of them anyway) and takes the first "version" line, which is the top-level one in a pretty-printed manifest.
+  local v=""
+  if command -v python3 >/dev/null 2>&1; then v=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$f" 2>/dev/null || true); fi
+  if [ -z "$v" ] && command -v jq >/dev/null 2>&1; then v=$(jq -r '.version // ""' "$f" 2>/dev/null || true); fi
+  [ -n "$v" ] || v=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)
+  [ -n "$v" ] || { echo "unknown (no version in $f)"; return 1; }
+  printf '%s\n' "$v"
+}
+
+case "${1:-}" in
+  acquire) shift; cmd_acquire "$@" ;;
+  renew) shift; cmd_renew "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  release-all) cmd_release_all ;;
+  with) shift; cmd_with "$@" ;;
+  check) shift; cmd_check "$@" ;;
+  free) shift; cmd_free "$@" ;;
+  wait) shift; cmd_wait "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  clean) cmd_clean ;;
+  check-conf) cmd_check_conf ;;
+  guard) cmd_guard ;;
+  whoami) owner_id; echo ;;
+  version|--version) cmd_version ;;
+  -h|--help|help|'') usage ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac

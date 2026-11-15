@@ -1,0 +1,25 @@
+name: Close silent decisions
+# A `decision` issue untouched for 7 days is accepted, per the team process.
+# An issue the owner reopened is never closed again by this workflow.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+permissions:
+  issues: write
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cutoff=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh issue list --repo "$REPO" --label decision --state open --json number,updatedAt --limit 200 \
+            --jq ".[] | select(.updatedAt < \"$cutoff\") | .number" | while read -r n; do
+            reopened=$(gh api "repos/$REPO/issues/$n/events" --paginate --slurp --jq '[.[][] | select(.event == "reopened")] | length')
+            if [ "${reopened:-0}" -gt 0 ]; then echo "skipping #$n: it was reopened, so it is the owner's"; continue; fi
+            gh issue close "$n" --repo "$REPO" --comment "Accepted by silence: no comment for 7 days, per the team process. To overrule, comment (and reopen); a reopen alone is not seen by the agents."
+            echo "closed #$n"
+          done

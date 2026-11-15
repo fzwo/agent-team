@@ -1,0 +1,35 @@
+# ~/.agentlock/guard.conf — which commands need which lock. One rule per line:
+# <resource><TAB><extended regex matched against the Bash command>
+# A rule for "sim" is satisfied by a lock named "sim" or any "sim:<name>".
+# Copy this file to ~/.agentlock/guard.conf, keep only what applies to the machine,
+# and run `agentlock check-conf` after editing: a rule that is not a valid regex
+# makes the guard block every command until it is fixed.
+# Before matching, continued lines are joined, heredoc bodies are blanked and each quoted
+# string is cut to its first word, so `open -a "Simulator"` still matches and a quoted
+# sentence does not; a $(…) or backtick substitution, quoted or not, is matched as a
+# statement of its own, so `udid="$(xcrun simctl boot …)"` needs its lock. Rules are then matched per statement (split on ; || & and newlines)
+# against the segments that run something: a segment whose command only reads or prints text
+# (grep, echo, cat, sed …) is not matched unless it holds a $(…) or a shell reads its output.
+# Separators are removed, so a rule must not depend on seeing | ; or & around a command.
+# `agentlock acquire X … && <command>` counts as holding X for the rest of that statement.
+
+# Anything that takes the screen, keyboard focus or the simulator window.
+ui	\b(screencapture|cliclick)\b|\bosascript(\s+(-e|-l|\S+\.(scpt|applescript))|\s*<<)|(^|[;|&({`]|\b(if|then|else|do|env|nohup|time|exec|caffeinate|sudo|xargs)\s+)\s*osascript\b|open -a "?'?Simulator|open -b com\.apple\.dt\.Devices|DeviceHub|xcodebuild[^|;&]*platform=macOS[^|;&]*\s(test|test-without-building)(\s|$)|xcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*platform=macOS
+# iOS simulators (the verbs that change or read a device; `list`, `bootstatus` and friends need none), and a test
+# run on a simulator-family destination (platform=iOS/tvOS/watchOS/visionOS, a destination starting with id=/name=/OS=, or no
+# destination at all, which an iOS scheme resolves to a simulator; uppercase BUILD_SETTING=value pairs do not
+# count as a destination; a macOS-only project edits this, since the rule cannot know the scheme): it serialises
+# with other simulator users, not with the screen. Each keyed form is written twice, for the action before and
+# after the destination (`xcodebuild test -destination …` and `xcodebuild -destination … test`)
+# (0.4.7; before, it took ui). A macOS test run (platform=macOS) drives a window: ui above, and not sim.
+sim	\bsimctl\s+(boot|shutdown|install|launch|terminate|io|erase|openurl)\b|xcodebuild[^|;&]*(platform=(iOS|tvOS|watchOS|visionOS|xrOS)|-destination[[:space:]]+['"]?(id|name|OS)=)[^|;&]*\s(test|test-without-building)(\s|$)|xcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*(platform=(iOS|tvOS|watchOS|visionOS|xrOS)|-destination[[:space:]]+['"]?(id|name|OS)=)|xcodebuild([^|;&=]|[A-Z_][A-Z0-9_]*=[^[:space:]|;&]*)*\s(test|test-without-building)(\s([^|;&=]|[A-Z_][A-Z0-9_]*=[^[:space:]|;&]*)*)?(\||;|&|$)
+
+# Physical devices, and a test run on one (platform=iOS followed by a comma, not "Simulator"), which takes device as well as sim.
+device	\b(devicectl|ios-deploy|idevice[a-z]*)\b|\bxctrace\s+(record|export)\b|\bxcodebuild[^|;&]*platform=(iOS|tvOS|watchOS|visionOS),[^|;&]*\s(test|test-without-building)(\s|$)|\bxcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*platform=(iOS|tvOS|watchOS|visionOS),
+# Web projects: a dev server on a fixed port, a shared dev database.
+# port:3000	\b(npm run dev|next dev|vite)\b
+# db:dev	\b(prisma migrate|rails db:|alembic upgrade)\b
+
+# Heavy work. Needs no lock of its own, but is blocked for everyone else while
+# some session holds "quiet" for a measurement.
+heavy	\b(xcodebuild|swift build|swift test|npm run build|npm test|pnpm (build|test)|cargo (build|test)|playwright|docker build|ffmpeg)\b

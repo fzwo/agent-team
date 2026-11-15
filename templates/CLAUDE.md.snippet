@@ -1,0 +1,27 @@
+# <Project name>   <!-- team-init sets this; the shift is announced with it -->
+
+## Team process (agent-team plugin)
+
+Role: engineering            # engineering | design
+Profile: apple               # apple | web | none
+Review model, high tier: session   # `session` = the session's model; name another (opus, fable) for every round of a high-tier review, the expensive choice, so it is the owner's
+Plugin feedback: <channel>   # where a shift sends what it learned about the plugin, when there is something: 'SendMessage to the session named "<maintainer session name>", else an issue on <owner>/agent-team' (name the session as the app shows it; an id may not resolve, and a session may lack the tool); leave unset to send nothing
+Shifts chain: yes   # a shift whose context runs out with work queued starts the next one itself (shift-start.sh); `no` leaves every start to the owner; `max N` allows N self-started shifts in a row (one shift can use a large share of a weekly limit)
+Shift sessions: keep   # keep: ended shifts stay open in the app until the owner archives them, and the next start closes what was archived (an idle claude each meanwhile); close: shift-start.sh --close-ended closes them at once (the app archives them, readable)
+
+Follow the `agent-team:team-process` skill for every piece of work; read it at session start.
+Direction: `ROADMAP.md` (owner's). What is in flight: `.agent-team/state.md`. Structure: `ARCHITECTURE.md`. Design docs: `DESIGN.md`, `TOKENS.md`, `design/`.
+
+## Project facts for the profile
+
+<!-- apple -->
+Simulator for screenshots: iPhone 16e (390 × 844 pt), light and dark. Extra boards: de, largest text size.
+Devices: <name> <udid>
+Build folder per target: build/<target>-derived (reused across branches)
+
+<!-- web -->
+Viewports for screenshots: 390 × 844, 1280 × 800. Dev server: port 3000. Dev database: db:dev. Staging: <url>
+
+## Project rules
+
+<!-- things only this project needs; keep short, the process itself lives in the skill -->

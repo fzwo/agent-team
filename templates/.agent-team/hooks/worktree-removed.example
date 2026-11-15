@@ -1,0 +1,13 @@
+#!/bin/bash
+# Run by the plugin's pr-cleanup.sh with the worktree's absolute path as $1, before the
+# worktree is removed. Remove what this project keeps per checkout OUTSIDE the worktree.
+# Compute exact names from the path; never glob, so another session's live folders are safe.
+# Copy to .agent-team/hooks/worktree-removed, make it executable, and commit it.
+set -eu
+wt="$1"
+# Example: a build folder named for a hash of the checkout path, as scripts/check-ios-build.sh makes it.
+# key=$(printf '%s' "$wt" | shasum | cut -c1-12)
+# for d in "$TMPDIR/build-$key" "$TMPDIR/strings-$key"; do
+#   [ -d "$d" ] && rm -rf "$d" && echo "removed $d"
+# done
+exit 0

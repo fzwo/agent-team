@@ -1,0 +1,14 @@
+{
+  "name": "fzwo",
+  "owner": {
+    "name": "fzwo"
+  },
+  "plugins": [
+    {
+      "name": "agent-team",
+      "source": "./",
+      "description": "Owner-plus-two-agents development process: skill, agent briefs, hooks, lock, watcher, repo templates."
+    }
+  ],
+  "description": "fzwo's plugins: the agent-team development process."
+}
