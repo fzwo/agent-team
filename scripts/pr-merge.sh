@@ -14,21 +14,25 @@
 # the base and the head from origin into refs of its own (refs/pr-merge/<pr>/, removed when it exits), so the
 # clone's refspec does not matter and two runs for two PRs in one repository do not mix.
 # --dry-run runs every check and the wait, prints what would merge and exits 0 without merging (exit 1 on a refusal),
-# so the script can be tried on a live PR. PR_MERGE_POLL (seconds between checks, default 5) is for the tests.
+# so the script can be tried on a live PR. The fetch lands in the checkout the script runs from (refs of its own,
+# removed on exit): run it from your shift's checkout, not a shared one. PR_MERGE_POLL (seconds between checks,
+# default 5) is for the tests.
 set -eu
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
-pr="${1:-}"; shift || true
-case "$pr" in -h|--help) usage; exit 0 ;; ''|*[!0-9]*) echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run]" >&2; exit 2 ;; esac
-wait_m=90; method=merge; dry=""
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+# The PR number and the options in any order (`--dry-run 1141` and `1141 --dry-run` both work; the first form was a usage error once).
+pr=""; wait_m=90; method=merge; dry=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --wait-mergeable) wait_m="${2:-}"; case "$wait_m" in ''|*[!0-9]*) echo "--wait-mergeable needs a number of seconds" >&2; exit 2 ;; esac; shift 2 ;;
     --method) method="${2:-}"; case "$method" in merge|squash|rebase) ;; *) echo "--method is merge, squash or rebase" >&2; exit 2 ;; esac; shift 2 ;;
     --dry-run) dry=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *) case "$1" in *[!0-9]*) echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run]" >&2; exit 2 ;; esac
+       [ -z "$pr" ] || { echo "pr-merge.sh: one PR number, not two ($pr and $1)" >&2; exit 2; }; pr="$1"; shift ;;
   esac
 done
+[ -n "$pr" ] || { echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run]" >&2; exit 2; }
 poll="${PR_MERGE_POLL:-5}"
 state=$(gh pr view "$pr" --json state -q .state) || { echo "pr-merge.sh: cannot read #$pr" >&2; exit 1; }
 [ "$state" = OPEN ] || { echo "pr-merge.sh: #$pr is ${state:-unreadable}, not OPEN; nothing to merge" >&2; exit 1; }

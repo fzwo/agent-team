@@ -9,6 +9,7 @@ the wake command with that file's path as its only argument.
     watch-github.py --role engineering [--repo owner/name] [--interval 120]
                     [--slow-after 4] [--slow-interval 1800] [--idle-hours 168]
                     [--wake "<command>"] [--once] [--state-dir .agent-team]
+                    [--catch-up-hours 24]
 
 The schedule (the owner's, 2026-11-04): a check every --interval seconds until
 --slow-after hours have passed without activity, then every --slow-interval
@@ -23,7 +24,9 @@ listed when it appears or carries R's label; the other role's PRs only when
 labelled for R; an item R itself bumped last is not listed again. Agent comments on
 issues labelled `idea` are skipped; the owner's are not. Inline review comments
 on PR diffs are included. The cursor and the seen ids live in the state
-directory, so a restart does not replay old items.
+directory, so a restart does not replay old items; a start without a cursor (a
+first run, a fresh container) lists the last --catch-up-hours, so the previous
+shift's handled items reappear once and are to be skipped, not answered again.
 
 Wake examples (the command gets the summary path as $1):
   tmux:     --wake 'tmux send-keys -t eng -l "$(cat "$1")"; tmux send-keys -t eng Enter'
@@ -138,6 +141,7 @@ def main():
     ap.add_argument("--max-minutes", type=float, default=None)
     ap.add_argument("--fresh", action="store_true", help="count idle time from now (after the owner or the session was active)")
     ap.add_argument("--state-dir", default=".agent-team")
+    ap.add_argument("--catch-up-hours", type=float, default=24, help="with no cursor file, list what changed in the last N hours (default 24): a fresh container or a lost state dir must not skip what arrived in the gap")
     a = ap.parse_args()
 
     repo = a.repo
@@ -160,7 +164,9 @@ def main():
     if os.path.exists(cursor_file):
         since = open(cursor_file).read().strip()
     else:
-        since = iso(datetime.now(timezone.utc) - timedelta(minutes=5))
+        # No cursor: a first run, or a fresh container (the state dir lives in the checkout and is not committed). A
+        # design agent's questions arrived in such a gap and were never seen; start a day back, not five minutes.
+        since = iso(datetime.now(timezone.utc) - timedelta(hours=a.catch_up_hours))
     seen = set()
     if os.path.exists(seen_file):
         seen = set(open(seen_file).read().split())

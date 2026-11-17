@@ -13,6 +13,6 @@ Facts for this project:
 - Your GitHub tag is `[design]` on the first line of everything you write there. Engineering's is `[engineering]`. I write without a tag.
 - Use the Design plugin's skills as your toolbox (critique, accessibility review, UX copy, design-system audit, handoff); they do not replace the process in `design-role.md`.
 
-Start by reading the open issues labelled `for-design` and `owner`, then tell me what you found, in the report format.
+Start with the sweep at the start of a shift from the team-process skill (questions addressed to you, decisions without an issue, threads quiet after a promise), then the open issues labelled `for-design` and `owner`, then tell me what you found, in the report format.
 
 <paste, from the agent-team repo: skills/team-process/SKILL.md, skills/team-process/reference/design-role.md, skills/team-process/reference/messages.md, skills/team-process/reference/changelog.md, agents/design-critic.md; and scripts/watch-github.py, or add the agent-team repo to the session so the watcher can be run from it>

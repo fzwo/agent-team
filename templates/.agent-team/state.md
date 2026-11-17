@@ -18,5 +18,8 @@ Audits (PR, date, blocking finding yes/no):
 Standard tier on fresh reviewers since: no
 Last structure review (architecture.md): none  <!-- PR number and date -->
 
+## Promised
+<!-- one line per promise made in an issue: "#123: check after the next night (engineering)"; the next shift's sweep answers or flags each -->
+
 ## Things a fresh session would not know
 <!-- a build that needs a workaround, a lock someone holds, a device that is away -->

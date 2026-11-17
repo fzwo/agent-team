@@ -461,6 +461,15 @@ GH
   mkdir -p "$work/whome"   # an empty HOME: the caller's own plugin cache must not reach the watcher under test
   out=$(cd "$work/repo" && HOME="$work/whome" PATH="$work/bin:$PATH" python3 "$here/scripts/watch-github.py" --role engineering --repo x/y --once)
   check "item count" "$(printf '%s' "$out" | head -1 | sed 's/.*(\([0-9]*\) items).*/\1/')" 10
+  # No cursor file (a fresh container): the watcher lists the last day, not the last five minutes. The stub answers an
+  # issue updated two hours ago when since is earlier than that; with --catch-up-hours 1 since is later, and the issue stays unlisted.
+  mkdir -p "$work/nocur/.agent-team" "$work/nocurbin"; two_h_ago=$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+  printf '#!/bin/bash\nurl="${@: -1}"\ncase "$url" in *"/issues?"*) since="${url##*since=}"; since="${since%%%%&*}"; if [ "%s" \> "$since" ]; then echo %s; else echo "[]"; fi ;; *) echo "[]" ;; esac\n' "$two_h_ago" "'[{\"id\":501,\"number\":77,\"created_at\":\"$two_h_ago\",\"updated_at\":\"$two_h_ago\",\"state\":\"open\",\"title\":\"Question for you\",\"labels\":[],\"body\":\"[design]\\nis this fixed?\"}]'" > "$work/nocurbin/gh"; chmod +x "$work/nocurbin/gh"
+  nout=$(cd "$work/nocur" && HOME="$work/whome" PATH="$work/nocurbin:$PATH" python3 "$here/scripts/watch-github.py" --role engineering --repo x/y --once 2>&1)
+  printf '%s' "$nout" | grep -q "#77 issue by design" && ok "watcher: with no cursor it lists the last day, so a question posted two hours before a fresh start is seen" || bad "no-cursor catch-up: $nout"
+  rm -f "$work/nocur/.agent-team/watch-engineering."*
+  nout=$(cd "$work/nocur" && HOME="$work/whome" PATH="$work/nocurbin:$PATH" python3 "$here/scripts/watch-github.py" --role engineering --repo x/y --once --catch-up-hours 1 2>&1)
+  printf '%s' "$nout" | grep -q "#77 issue" && bad "catch-up of 1 h listed a 2 h old issue" || ok "watcher: --catch-up-hours bounds the catch-up"
   printf '%s' "$out" | grep -q "#15 issue by design, closed" && ok "an old issue the owner acted on after our comment is listed" || bad "owner action after our comment missed"
   printf '%s' "$out" | grep -q "#13 issue" && bad "an old issue bumped by our own comment listed" || ok "an old issue bumped by our own comment does not wake"
   printf '%s' "$out" | grep -q "#14 issue by design" && ok "an old issue bumped by the owner's comment is listed" || bad "owner-bumped old issue missing"
@@ -1081,8 +1090,11 @@ GH
   reset_stub; : > "$mg/stub/merge-fails"; out=$(pm 7 2>&1); rc=$?
   [ $rc = 1 ] && printf '%s' "$out" | grep -q "gh pr merge refused #7; nothing was merged. Do not close the issue" && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: a refused gh pr merge exits 1 and says not to close the issue" || bad "merge refused: rc=$rc $out"
   pm x >/dev/null 2>&1; check "merge: a non-numeric PR is a usage error, exit 2" $? 2
+  pm 7 8 2>&1 >/dev/null | grep -q "one PR number, not two (7 and 8)" && ok "merge: two PR numbers are a usage error that names both" || bad "two numbers: $(pm 7 8 2>&1)"
+  pm --dry-run >/dev/null 2>&1; check "merge: no PR number is a usage error, exit 2" $? 2
+  reset_stub; out=$(pm --dry-run 7 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "dry run: #7" && ok "merge: the options may come before the PR number" || bad "options first: rc=$rc $out"
   pm 7 --bogus >/dev/null 2>&1; check "merge: an unknown option is a usage error, exit 2" $? 2
-  h=$(bash "$here/scripts/pr-merge.sh" --help); printf '%s' "$h" | grep -q -- '--wait-mergeable' && [ "$(printf '%s' "$h" | tail -1)" = "so the script can be tried on a live PR. PR_MERGE_POLL (seconds between checks, default 5) is for the tests." ] && ok "merge: --help prints the whole header" || bad "merge --help: $(printf '%s' "$h" | tail -1)"
+  h=$(bash "$here/scripts/pr-merge.sh" --help); printf '%s' "$h" | grep -q -- '--wait-mergeable' && [ "$(printf '%s' "$h" | tail -1)" = "default 5) is for the tests." ] && ok "merge: --help prints the whole header" || bad "merge --help: $(printf '%s' "$h" | tail -1)"
 fi
 
 if run publish; then echo "publish"
