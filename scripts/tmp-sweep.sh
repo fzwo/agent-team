@@ -11,7 +11,9 @@
 # fail past a few tens of thousands of entries and every listing is slow. The process rule is "delete by exact
 # name, never by pattern"; this script is the one exception, with the matching kept tight: each class is
 # matched by name shape and by content (a lone marker file; an `IB/` of pipes and sockets under a pid that is
-# gone; a zero-length lock file no process holds open) and by age, and anything else in the directory is left
+# gone; a zero-length lock file no process holds open; an `instruments*.ktrace` trace bundle, which Instruments
+# and `xctrace` write to $TMPDIR and never remove, 30-40 MB for a Time Profiler run and gigabytes for Animation
+# Hitches, skipped while Instruments or xctrace runs) and by age, and anything else in the directory is left
 # alone. The project's own build folders
 # are not debris; the project's worktree hook removes those.
 set -eu
@@ -21,7 +23,7 @@ while [ $# -gt 0 ]; do
     --delete) delete=1; shift ;;
     --age-hours) age_hours="${2:-}"; case "$age_hours" in ''|*[!0-9]*) echo "--age-hours needs a number" >&2; exit 2 ;; esac; shift 2 ;;
     --warn-entries) warn_entries="${2:-}"; case "$warn_entries" in ''|*[!0-9]*) echo "--warn-entries needs a number" >&2; exit 2 ;; esac; shift 2 ;;
-    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) dir="$1"; shift ;;
   esac
@@ -123,8 +125,23 @@ LSOF
     done
   fi
 fi
+# 4. Instruments trace bundles (`instruments_<...>.ktrace`, a folder): Instruments and `xctrace record` write them to
+#    $TMPDIR and never remove them (a shift found 59 piled up by mid-shift, the Animation Hitches ones at 4-6 GB each).
+#    Removed by name shape and age; the class is skipped while Instruments or xctrace runs, since a recording in
+#    progress is a young bundle but the age check alone is the only thing between it and the sweep.
+kt_all=0; kt_old=0; kt_gone=0; kt_note=""
+if pgrep -x 'xctrace|Instruments' >/dev/null 2>&1; then kt_note=" (Instruments or xctrace is running: trace bundles are left alone this time)"; fi
+while IFS= read -r -d '' d; do
+  kt_all=$((kt_all + 1))
+  [ -z "$kt_note" ] || continue
+  [ -d "$d" ] && [ ! -L "$d" ] || continue   # belt and braces: find -type d without -L never yields a symlink
+  old_enough "$d" || continue
+  kt_old=$((kt_old + 1))
+  if [ -n "$delete" ]; then rm -rf -- "$d" && kt_gone=$((kt_gone + 1)); fi
+done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -name 'instruments*.ktrace' -print0 2>/dev/null)
 mode="would remove"; [ -n "$delete" ] && mode="removed"
 echo "$dir: $total entries"
 echo "TemporaryDirectory.* folders: $td_all; debris (a lone empty .keep-directory, older than ${age_hours} h): $td_old; $mode: $( [ -n "$delete" ] && echo $td_gone || echo $td_old )"
 echo "ibtoold-* folders: $ib_all; debris (pid gone, only an IB/ of pipes and sockets, older than ${age_hours} h): $ib_old; $mode: $( [ -n "$delete" ] && echo $ib_gone || echo $ib_old )"
 echo "SwiftPM path-named .lock files: $lk_all; debris (older than ${age_hours} h, open by no process): $lk_old; $mode: $( [ -n "$delete" ] && echo $lk_gone || echo $lk_old )$lk_note"
+echo "Instruments .ktrace bundles: $kt_all; debris (older than ${age_hours} h): $kt_old; $mode: $( [ -n "$delete" ] && echo $kt_gone || echo $kt_old )$kt_note"

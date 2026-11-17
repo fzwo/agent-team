@@ -25,7 +25,12 @@ ui	\b(screencapture|cliclick)\b|\bosascript(\s+(-e|-l|\S+\.(scpt|applescript))|\
 sim	\bsimctl\s+(boot|shutdown|install|launch|terminate|io|erase|openurl)\b|xcodebuild[^|;&]*(platform=(iOS|tvOS|watchOS|visionOS|xrOS)|-destination[[:space:]]+['"]?(id|name|OS)=)[^|;&]*\s(test|test-without-building)(\s|$)|xcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*(platform=(iOS|tvOS|watchOS|visionOS|xrOS)|-destination[[:space:]]+['"]?(id|name|OS)=)|xcodebuild([^|;&=]|[A-Z_][A-Z0-9_]*=[^[:space:]|;&]*)*\s(test|test-without-building)(\s([^|;&=]|[A-Z_][A-Z0-9_]*=[^[:space:]|;&]*)*)?(\||;|&|$)
 
 # Physical devices, and a test run on one (platform=iOS followed by a comma, not "Simulator"), which takes device as well as sim.
-device	\b(devicectl|ios-deploy|idevice[a-z]*)\b|\bxctrace\s+(record|export)\b|\bxcodebuild[^|;&]*platform=(iOS|tvOS|watchOS|visionOS),[^|;&]*\s(test|test-without-building)(\s|$)|\bxcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*platform=(iOS|tvOS|watchOS|visionOS),
+# devicectl's reads (`list …`, `device info …`) need no lock; its acting verbs are listed (Xcode 27.2, 2026-11: a new verb
+# that acts goes on this list, in the project's copy), with global options before the verb allowed, each with at most one
+# value (`-j out.json`, `--timeout 5`, `-j out\ file.json`; inside brackets whitespace is `[:space:]`, since `\s` there is two
+# literal characters). Not covered: a bare `-` as a value, a quoted verb (`'device' install`), as for every verb-listed rule.
+# A read before an `acquire && …` chain once blocked a whole command.
+device	\bdevicectl(\s+-\S+(\s+[^-[:space:]]\S*(\\ \S*)*)?)*\s+(device\s+(install|uninstall|process|copy|reboot|notify|disconnect|lock|unlock)|manage)\b|\b(ios-deploy|idevice[a-z]*)\b|\bxctrace\s+(record|export)\b|\bxcodebuild[^|;&]*platform=(iOS|tvOS|watchOS|visionOS),[^|;&]*\s(test|test-without-building)(\s|$)|\bxcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*platform=(iOS|tvOS|watchOS|visionOS),
 # Web projects: a dev server on a fixed port, a shared dev database.
 # port:3000	\b(npm run dev|next dev|vite)\b
 # db:dev	\b(prisma migrate|rails db:|alembic upgrade)\b

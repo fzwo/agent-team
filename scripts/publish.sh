@@ -28,6 +28,9 @@ here=$(cd "$(dirname "$0")/.." && pwd -P)
 [ -f "$here/scripts/publish-subs.py" ] || { echo "publish.sh: $here/scripts/publish-subs.py is absent: this is the public copy; publish from the maintainer's repository" >&2; exit 2; }
 [ -n "$src" ] || src="$here"
 src=$(cd "$src" && pwd -P)
+if [ -e "$pub_dir" ]; then pub_res=$(cd "$pub_dir" 2>/dev/null && pwd -P) || pub_res=""
+  case "$src" in "$pub_res"|"$pub_res"/*) echo "publish.sh: --public-dir is the source checkout itself or holds it; the public clone must be another directory, since its tree is replaced" >&2; exit 2 ;; esac
+fi
 git -C "$src" rev-parse --verify HEAD >/dev/null 2>&1 || { echo "publish.sh: $src is not a git repository with a commit" >&2; exit 2; }
 if [ -n "$(git -C "$src" status --porcelain)" ]; then echo "publish.sh: $src has uncommitted or untracked files; publish a commit, not a working tree" >&2; exit 2; fi
 head_sha=$(git -C "$src" rev-parse --short HEAD)
@@ -48,6 +51,10 @@ else
 fi
 pub_dir=$(cd "$pub_dir" && pwd -P)   # a symlink here would make find's start point below yield nothing
 [ "$(git -C "$pub_dir" remote get-url origin)" = "$pub_url" ] || { echo "publish.sh: $pub_dir is a clone of $(git -C "$pub_dir" remote get-url origin), not of $pub_url" >&2; exit 2; }
+# The remote's heads are what the fetch or clone just brought: no second network call, whose failure would read as "no heads".
+if ! git -C "$pub_dir" rev-parse --verify -q origin/main >/dev/null && [ -n "$(git -C "$pub_dir" for-each-ref refs/remotes/origin/ --format='%(refname)' | grep -v '/origin/HEAD$' || true)" ]; then   # the prefix form: a glob would miss release/1
+  echo "publish.sh: $pub_url has branches but no main; this script publishes to main only" >&2; exit 2
+fi
 if git -C "$pub_dir" rev-parse --verify -q origin/main >/dev/null; then
   # Forced: a preview looked at and touched, or a run interrupted half-way, leaves the clone dirty; a failure here is fatal.
   git -C "$pub_dir" checkout -q -f -B main origin/main && git -C "$pub_dir" reset -q --hard origin/main && git -C "$pub_dir" clean -qfdx \

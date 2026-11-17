@@ -27,6 +27,8 @@ One report, when you are done: the hand-back is the channel, and a second report
 
 ## Rules
 
+- Hand back only when nothing you started is still running: wait for or stop every background command first. A hand-back with work still running sends the session a notice per remaining job, five to eight per builder in one shift, and the session cannot tell them from your report.
+- Spell a deletion with a literal path where you can (`cd <dir> && rm -rf ./<name>`): the harness's own check refuses `rm -rf` of a path built from a variable even as `"$dir/${name:?}"`, and each refusal costs a retry.
 - Delete only files you created, by exact name, never by pattern. Never remove build folders, worktrees, branches or scratch files that are not yours. When your PR merges, delete your own large scratch items by exact name: copies of built apps, screen videos, traces, benchmark data. Keep phone and database backups until the device work that needed them is finished.
 - Keep your worktree until your PR shows MERGED; the review fixes happen in it.
 - Keep the profile's disk floor free (your brief names it); if a build would break that, stop and say so.

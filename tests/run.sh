@@ -143,6 +143,23 @@ if run lock; then echo "lock"
   ( sleep 2; AGENTLOCK_OWNER=A $L release sim:p >/dev/null ) & PATH="$work/nops:$PATH" AGENTLOCK_POLL=1 AGENTLOCK_OWNER=B $L acquire sim:p --ttl 1m --wait 10s >/dev/null 2>&1; check "a failing ps does not end the wait: the lock is acquired once released" $? 0
   AGENTLOCK_OWNER=B $L release sim:p >/dev/null
   # The lock name carries this suite's pid: the pgrep below is machine-wide and once saw another suite's waiter (round 47).
+  # A re-acquire of an own lock refreshes but never shortens: with 1 h left, --ttl 1m leaves the expiry; --ttl 2h moves it out.
+  AGENTLOCK_OWNER=A $L acquire ra --ttl 1h >/dev/null; e1=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
+  out=$(AGENTLOCK_OWNER=A $L acquire ra --ttl 1m); rc=$?; e2=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
+  [ $rc = 0 ] && [ "$e2" = "$e1" ] && printf '%s' "$out" | grep -q "never shortens a lock, renew extends it" && ok "re-acquire with a shorter ttl keeps the expiry and says so" || bad "shorter re-acquire: rc=$rc $e1 -> $e2: $out"
+  out=$(AGENTLOCK_OWNER=A $L acquire ra --ttl 2h); e3=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
+  [ "$e3" -gt "$e1" ] && printf '%s' "$out" | grep -q "ttl refreshed to 7200s" && ok "re-acquire with a longer ttl moves the expiry out" || bad "longer re-acquire: $e1 -> $e3: $out"
+  out=$(AGENTLOCK_OWNER=A $L acquire ra --ttl 0); e4=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
+  [ "$e4" = 0 ] && printf '%s' "$out" | grep -q "now with no expiry" && ok "re-acquire with --ttl 0 extends a timed lock to no expiry" || bad "ttl 0 re-acquire: $e4: $out"
+  out=$(AGENTLOCK_OWNER=A $L acquire ra --ttl 1m); e5=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
+  [ "$e5" = 0 ] && printf '%s' "$out" | grep -q "no expiry (kept" && ok "re-acquire of a lock without expiry keeps it so" || bad "unlimited re-acquire: $e5: $out"
+  # A stale own lock (anchor pid dead, same owner after a resume) is not kept: the re-acquire rewrites it, so it is live again.
+  AGENTLOCK_OWNER=A $L release ra >/dev/null; AGENTLOCK_OWNER=A $L acquire ra --ttl 1h >/dev/null; sed -i.bak 's/^pid=.*/pid=4194300/' "$AGENTLOCK_DIR/locks/ra/info"; rm -f "$AGENTLOCK_DIR/locks/ra/info.bak"
+  grep -q '^ttl=3600$' "$AGENTLOCK_DIR/locks/ra/info" || bad "stale fixture is not a fresh 1 h lock"
+  out=$(AGENTLOCK_OWNER=A $L acquire ra --ttl 10m); rc=$?
+  [ $rc = 0 ] && printf '%s' "$out" | grep -q "ttl refreshed to 600s" && AGENTLOCK_OWNER=A $L check ra >/dev/null 2>&1 && ! AGENTLOCK_OWNER=B $L acquire ra --ttl 1m >/dev/null 2>&1 && ok "a stale own lock is rewritten by a re-acquire, not kept: it is held again and refused to others" || bad "stale own re-acquire: rc=$rc $out / $($L status 2>&1 | grep ra)"
+  AGENTLOCK_OWNER=A $L release ra >/dev/null
+  h=$($L --help); printf '%s' "$h" | grep -q "never shortens it" && printf '%s' "$h" | tail -1 | grep -q "^  AGENTLOCK_AS=<name> agentlock" && ok "agentlock --help prints the whole header, to its AGENTLOCK_AS line" || bad "agentlock --help last line: $(printf '%s' "$h" | tail -1)"
   AGENTLOCK_OWNER=A $L acquire ui --ttl 1m >/dev/null; AGENTLOCK_OWNER=A $L acquire "orphan$$" --ttl 1m >/dev/null
   ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W exec bash -c "$L acquire orphan$$ --wait 30s >/dev/null 2>&1; echo waiter-exit=\$? > '$work/waiter.rc'" ) & wsh=$!
   sleep 1.5; { kill -KILL $wsh; wait $wsh; } 2>/dev/null; sleep 3
@@ -257,14 +274,25 @@ if run guard; then echo "guard"
   check "a heredoc opener inside quotes does not stop later joins" "$(gm Z '"echo \"<<EOT\" > x\nxcodebuild -scheme X \\\n  test"')" "sim"
   check "a here-string is not a heredoc opener and does not stop later joins" "$(gm Z '"grep x <<< foo\nxcodebuild -scheme X \\\n  test"')" "sim"
   # Config rules see only the segments that run something; acquire && command grants the lock for the line.
-  check "a grep whose pattern names tools is text, not a tool" "$(g Z '"ps -axo pid,command | grep -E \"devicectl|xcodebuild|simctl\""')" 0
-  check "a tool after a text segment still needs its lock" "$(gm Z '"grep foo log; xcrun devicectl list devices"')" "device"
+  check "a grep whose pattern names tools is text, not a tool" "$(g Z '"ps -axo pid,command | grep devicectl device install"')" 0   # unquoted: the guard cuts a quoted string to its first word
+  check "an echo that names a tool is text" "$(g Z '"echo xcrun devicectl device install app"')" 0
+  check "a tool after a text segment still needs its lock" "$(gm Z '"grep foo log; xcrun devicectl device install app --device 1 x.app"')" "device"
+  check "devicectl list needs no lock" "$(g Z '"xcrun devicectl list devices"')" 0
+  check "devicectl device info needs no lock" "$(g Z '"xcrun devicectl device info details --device 00008130"')" 0
+  check "devicectl device process launch needs the device" "$(gm Z '"xcrun devicectl device process launch --device 00008130 com.x.app"')" "device"
+  check "devicectl manage needs the device" "$(gm Z '"xcrun devicectl manage pair --device 00008130"')" "device"
+  check "an option between devicectl and its verb still needs the device" "$(gm Z '"xcrun devicectl -v device install app --device 00008130 x.app"')" "device"
+  check "options with values between devicectl and its verb still need the device" "$(gm Z '"xcrun devicectl -j out.json --timeout 5 device install app --device 00008130 x.app"')" "device"
+  check "options before a read still need nothing" "$(g Z '"xcrun devicectl -j out.json device info details --device 00008130"')" 0
+  check "an option value starting with s is a value, not the end of the match" "$(gm Z '"xcrun devicectl -j status.json device install app --device 00008130 x.app"')" "device"
+  check "an option value with an escaped space is one value" "$(gm Z '"xcrun devicectl -j out\\ file.json device install app --device 00008130 x.app"')" "device"
+  check "a read, then acquire && an acting verb: the read needs nothing and the chain is granted" "$(g Z '"xcrun devicectl list devices; agentlock acquire device:00008130 --ttl 10m --reason x && xcrun devicectl device install app --device 00008130 x.app"')" 0
   check "text piped into a shell keeps every segment" "$(gm Z '"echo xcrun simctl boot X | sh"')" "sim"
   check "acquire && command needs no lock held yet" "$(g Z '"agentlock acquire device:00008130 --ttl 30m --reason install && xcrun devicectl device install app --device 00008130 x.app"')" 0
   check "acquire ; command is not a grant" "$(gm Z '"agentlock acquire device:00008130 --ttl 30m; xcrun devicectl device install app --device 00008130 x.app"')" "device"
-  check "acquire of another resource && command still needs the right lock" "$(gm Z '"agentlock acquire sim:x --ttl 30m && xcrun devicectl list devices"')" "device"
+  check "acquire of another resource && command still needs the right lock" "$(gm Z '"agentlock acquire sim:x --ttl 30m && xcrun devicectl device install app --device 1 x.app"')" "device"
   check "a command substitution inside an echo still runs a tool" "$(gm Z '"echo $(xcrun simctl boot X)"')" "sim"
-  check "a backtick substitution inside a head still runs a tool" "$(gm Z '"head -1 `xcrun devicectl list devices`"')" "device"
+  check "a backtick substitution inside a head still runs a tool" "$(gm Z '"head -1 `xcrun devicectl device install app --device 1 x.app`"')" "device"
   check "a process substitution inside a cat still runs a tool" "$(gm Z '"cat <(xcrun simctl boot X)"')" "sim"
   check "a grant does not reach back before the acquire" "$(gm Z '"xcrun simctl boot X; agentlock acquire sim:x --ttl 1m && true"')" "sim"
   check "a grant ends at the semicolon" "$(gm Z '"agentlock acquire sim:x --ttl 1m && echo ok; xcrun simctl boot X"')" "sim"
@@ -272,8 +300,8 @@ if run guard; then echo "guard"
   check "the word agentlock inside an echo grants nothing" "$(gm Z '"echo agentlock acquire sim:x --ttl 1m && xcrun simctl boot X"')" "sim"
   check "a command merely ending in agentlock grants nothing" "$(gm Z '"notagentlock acquire sim:x --ttl 1m && xcrun simctl boot X"')" "sim"
   check "acquire piped somewhere grants nothing" "$(gm Z '"agentlock acquire sim:x --ttl 1m | tee log && xcrun simctl boot X"')" "sim"
-  check "with X -- command piped into a filter is granted X" "$(g Z '"agentlock with device:00008130 -- xcrun devicectl list devices | grep iPhone"')" 0
-  check "with X grants only X" "$(gm Z '"agentlock with sim:x -- xcrun devicectl list devices | grep iPhone"')" "device"
+  check "with X -- command piped into a filter is granted X" "$(g Z '"agentlock with device:00008130 -- xcrun devicectl device install app --device 1 x.app | grep iPhone"')" 0
+  check "with X grants only X" "$(gm Z '"agentlock with sim:x -- xcrun devicectl device install app --device 1 x.app | grep iPhone"')" "device"
   check "a with grant ends at the && after its chain (with releases X there)" "$(gm Z '"agentlock with sim:x -- xcrun simctl boot X && xcodebuild test -scheme X -destination \"platform=iOS Simulator,name=iPhone 16e\""')" "sim"
   check "with --ttl before the resource grants the resource" "$(g Z '"agentlock with --ttl 1m sim:x -- xcrun simctl boot X | cat"')" 0
   check "acquire --ttl before the resource grants the resource" "$(g Z '"agentlock acquire --ttl 1m sim:x && xcrun simctl boot X"')" 0
@@ -894,6 +922,8 @@ if run sweep; then echo "sweep"
     : > _Users_held_x.lock   # old, held open by a process during the run: stays
     mkdir -p TemporaryDirectory.eeeeee; echo content > TemporaryDirectory.eeeeee/.keep-directory   # old, marker with content: stays
     : > _private_var_folders_zz_T_proj-ios-build-abc_dd_SourcePackages_x.lock; : > _Users_me_x.lock; echo z > _private_var_folders_full.lock; : > other.lock; echo k > keepme/file
+    mkdir -p instruments_old.ktrace/corespace instruments_new.ktrace other.ktrace keepme/instruments_nested.ktrace; echo t > instruments_old.ktrace/corespace/data; ln -s targets/pipes instruments_link.ktrace   # an old bundle (goes), a new one, another tool's, a symlink (stay)
+    touch -h -t 202001010000 instruments_link.ktrace 2>/dev/null || true; touch -t 202001010000 instruments_old.ktrace other.ktrace keepme/instruments_nested.ktrace   # the nested one is old but below depth 1: stays
     touch -h -t 202001010000 TemporaryDirectory.linkdr ibtoold-4194307 _Users_link_x.lock 2>/dev/null || true
     touch -t 202001010000 targets/lonely targets/pipes targets/zero.lock ibtoold-4194308 ibtoold-4194309 "$(printf '_Users_tab\tx.lock')"
     touch -t 202001010000 TemporaryDirectory.aaaaaa TemporaryDirectory.bbbbbb TemporaryDirectory.cccccc TemporaryDirectory.eeeeee ibtoold-4194301 ibtoold-4194302 ibtoold-4194303 ibtoold-4194305 ibtoold-4194306 "ibtoold-$$" _private_var_folders_zz_T_proj-ios-build-abc_dd_SourcePackages_x.lock _Users_me_x.lock _Users_held_x.lock _private_var_folders_full.lock other.lock keepme ); }
@@ -905,8 +935,9 @@ if run sweep; then echo "sweep"
   bash "$here/scripts/tmp-sweep.sh" "$sw" >/dev/null 2>&1; check "sweep: a report run under the real PATH exits 0" $? 0
   out=$(sweep --warn-entries 5 "$sw" 2>&1); rc=$?
   check "sweep: a report run exits 0" $rc 0
-  [ "$(ls -A "$sw" | wc -l | tr -d ' ')" = 26 ] && ok "sweep: a report run removes nothing" || bad "a report run removed something: $(ls -A "$sw")"
-  printf '%s' "$out" | grep -q "^warning: 26 entries" && ok "sweep: warns above the entry threshold" || bad "no entry warning: $out"
+  [ "$(ls -A "$sw" | wc -l | tr -d ' ')" = 30 ] && ok "sweep: a report run removes nothing" || bad "a report run removed something: $(ls -A "$sw")"
+  printf '%s' "$out" | grep -q "^warning: 30 entries" && ok "sweep: warns above the entry threshold" || bad "no entry warning: $out"
+  printf '%s' "$out" | grep -q "Instruments .ktrace bundles: 2; debris .*: 1; would remove: 1" && ok "sweep: counts the old trace bundle, not the new one, the symlink or another tool's .ktrace" || bad "ktrace count: $out"
   printf '%s' "$out" | grep -q "TemporaryDirectory.\* folders: 5; debris .*: 2; would remove: 2" && ok "sweep: counts the lone-marker folders older than a day, not the new one, the one with extra content or the one whose marker has content" || bad "TemporaryDirectory count: $out"
   printf '%s' "$out" | grep -q "ibtoold-\* folders: 9; debris .*: 2; would remove: 2" && ok "sweep: counts the dead tools' old pipe folders and the empty one, not the live pid's, the new one, the ones with a file, a dotfile or a symlink" || bad "ibtoold count: $out"
   if command -v lsof >/dev/null 2>&1; then
@@ -927,20 +958,27 @@ if run sweep; then echo "sweep"
   [ $rc = 0 ] && ok "sweep: --delete exits 0" || bad "sweep: --delete exited $rc: $out"
   left=$(ls -A "$sw" | sort | tr '\n' ' ')
   sorted_words() { printf '%s\n' $1 | sort | tr '\n' ' '; }   # the expected list is compared as a set: the suite's pid sorts anywhere
-  if command -v lsof >/dev/null 2>&1; then left_want="TemporaryDirectory.cccccc TemporaryDirectory.dddddd TemporaryDirectory.eeeeee _Users_held_x.lock _Users_new_x.lock _private_var_folders_full.lock ibtoold-$$ ibtoold-4194302 ibtoold-4194304 ibtoold-4194305 ibtoold-4194306 ibtoold-4194307 ibtoold-4194308 ibtoold-4194309 TemporaryDirectory.linkdr _Users_link_x.lock targets keepme other.lock "; else left_want="TemporaryDirectory.cccccc TemporaryDirectory.dddddd TemporaryDirectory.eeeeee _Users_held_x.lock _Users_me_x.lock _Users_new_x.lock _private_var_folders_full.lock _private_var_folders_zz_T_proj-ios-build-abc_dd_SourcePackages_x.lock ibtoold-$$ ibtoold-4194302 ibtoold-4194304 ibtoold-4194305 ibtoold-4194306 ibtoold-4194307 ibtoold-4194308 ibtoold-4194309 TemporaryDirectory.linkdr _Users_link_x.lock targets keepme other.lock "; fi
+  if command -v lsof >/dev/null 2>&1; then left_want="TemporaryDirectory.cccccc TemporaryDirectory.dddddd TemporaryDirectory.eeeeee _Users_held_x.lock _Users_new_x.lock _private_var_folders_full.lock ibtoold-$$ ibtoold-4194302 ibtoold-4194304 ibtoold-4194305 ibtoold-4194306 ibtoold-4194307 ibtoold-4194308 ibtoold-4194309 TemporaryDirectory.linkdr _Users_link_x.lock targets keepme other.lock instruments_new.ktrace instruments_link.ktrace other.ktrace "; else left_want="TemporaryDirectory.cccccc TemporaryDirectory.dddddd TemporaryDirectory.eeeeee _Users_held_x.lock _Users_me_x.lock _Users_new_x.lock _private_var_folders_full.lock _private_var_folders_zz_T_proj-ios-build-abc_dd_SourcePackages_x.lock ibtoold-$$ ibtoold-4194302 ibtoold-4194304 ibtoold-4194305 ibtoold-4194306 ibtoold-4194307 ibtoold-4194308 ibtoold-4194309 TemporaryDirectory.linkdr _Users_link_x.lock targets keepme other.lock instruments_new.ktrace instruments_link.ktrace other.ktrace "; fi
   left_want=$(sorted_words "$left_want")
   [ "$left" = "$left_want" ] && ok "sweep: --delete removes exactly the debris and leaves the rest (the held lock, the new items and the marker with content stay)" || bad "sweep left '$left', wanted '$left_want'"
-  [ -f "$sw/keepme/file" ] && ok "sweep: an unrelated folder keeps its content" || bad "keepme touched"
+  [ -f "$sw/keepme/file" ] && [ -d "$sw/keepme/instruments_nested.ktrace" ] && ok "sweep: an unrelated folder keeps its content, an old bundle below depth 1 included" || bad "keepme touched: $(ls -A "$sw/keepme")"
   [ -p "$sw/ibtoold-$$/IB/b.HostToRemote" ] && ok "sweep: a live tool's pipes stay" || bad "a live pid's ibtoold folder was touched"
   [ -L "$sw/ibtoold-4194305/IB/link" ] && ok "sweep: a symlink to a pipe inside IB/ is not a pipe, the folder stays" || bad "the folder with a symlink was swept"
   [ -L "$sw/ibtoold-4194306/IB" ] && ok "sweep: an IB that is itself a symlink keeps its folder" || bad "the folder whose IB is a symlink was swept"
+  [ -d "$sw/targets/pipes" ] && [ ! -e "$sw/instruments_old.ktrace" ] && ok "sweep: the old trace bundle is gone, the symlink's target bundle is untouched" || bad "ktrace: $(ls -A "$sw" | grep ktrace)"
   [ -f "$sw/targets/lonely/.keep-directory" ] && [ -p "$sw/targets/pipes/p.HostToRemote" ] && [ -f "$sw/targets/zero.lock" ] && ok "sweep: the targets of depth-1 symlinks are untouched" || bad "a symlink's target was touched: $(ls -AR "$sw/targets")"
   # A build tool running on the machine: the lock class is left alone this time, and the report says so.
   rm -rf "$sw"; mkdir -p "$sw" "$work/sweep/build"; plant
-  printf '#!/bin/bash\nexit 0\n' > "$work/sweep/build/pgrep"; chmod +x "$work/sweep/build/pgrep"
+  printf '#!/bin/bash\ncase "$*" in *swift-build*) exit 0 ;; *) exit 1 ;; esac\n' > "$work/sweep/build/pgrep"; chmod +x "$work/sweep/build/pgrep"   # a build tool runs, Instruments does not
   out=$(PATH="$work/sweep/build:$PATH" bash "$here/scripts/tmp-sweep.sh" --delete "$sw" 2>&1); rc=$?
   [ $rc = 0 ] && [ -f "$sw/_Users_me_x.lock" ] && printf '%s' "$out" | grep -q "a Swift or Xcode build tool is running: lock files are left alone" && ok "sweep: with a build tool running the lock files stay and the report says why" || bad "gate: rc=$rc $out / $(ls -A "$sw")"
   [ ! -d "$sw/TemporaryDirectory.aaaaaa" ] && ok "sweep: with a build tool running the folders are still swept" || bad "folders not swept under the gate"
+  [ ! -e "$sw/instruments_old.ktrace" ] && ok "sweep: a build tool does not gate the trace bundles" || bad "ktrace gated by a build tool: $out"
+  rm -rf "$sw"; mkdir -p "$sw" "$work/sweep/trace"; plant
+  printf '#!/bin/bash\ncase "$*" in *xctrace*) exit 0 ;; *) exit 1 ;; esac\n' > "$work/sweep/trace/pgrep"; chmod +x "$work/sweep/trace/pgrep"   # Instruments runs, no build tool
+  out=$(PATH="$work/sweep/trace:$PATH" bash "$here/scripts/tmp-sweep.sh" --delete "$sw" 2>&1); rc=$?
+  [ $rc = 0 ] && [ -d "$sw/instruments_old.ktrace" ] && printf '%s' "$out" | grep -q "Instruments .ktrace bundles: 2; debris .*: 0; removed: 0 (Instruments or xctrace is running: trace bundles are left alone" && ok "sweep: with Instruments running the trace bundles stay, counted, and the report says why" || bad "ktrace gate: rc=$rc $out"
+  [ ! -f "$sw/_Users_me_x.lock" ] && [ ! -d "$sw/TemporaryDirectory.aaaaaa" ] && ok "sweep: Instruments does not gate the other classes" || bad "other classes gated by Instruments"
   # Without lsof the lock files cannot be told from open ones: they stay, and the report says why.
   rm -rf "$sw"; mkdir -p "$sw" "$work/sweep/nolsof"; plant
   for t in bash ls find rm rmdir wc tr cat sed sort head mkdir pwd dirname basename touch kill mkfifo sleep; do p=$(command -v $t) && ln -sf "$p" "$work/sweep/nolsof/$t"; done

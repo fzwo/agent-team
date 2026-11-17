@@ -10,7 +10,8 @@
 # coreutils, ps and (for `guard`) python3 or jq.
 #
 #   agentlock acquire <resource> [--ttl 30m] [--reason "..."] [--wait [10m]]   (--wait alone waits 60m; a wait ends when the shell that
-#                                                                                 started it is gone or was never there: `( … --wait & )`)
+#                                                                                 started it is gone or was never there: `( … --wait & )`;
+#                                                                                 on a lock you hold it refreshes the ttl and never shortens it)
 #   agentlock renew <resource> [--ttl 30m]       push a held lock's expiry out by its own ttl, or by --ttl (the guard does the former on every guarded command)
 #   agentlock free <resource>                    exit 0 when nobody else holds it, 1 when someone does (`status` is a report and exits 0 either way)
 #   agentlock release <resource> [--force]
@@ -326,8 +327,23 @@ cmd_acquire() {
       retried=1; continue
     fi
     if held_by_me "$dir"; then
+      # Our own lock: refresh it, but never cut it short. A builder that re-acquires with a shorter --ttl on each
+      # step would otherwise shrink an hour's lock to minutes without noticing (a shift saw it, twice).
+      # No expiry (ttl 0) is the longest there is: it is kept against any --ttl, and --ttl 0 extends a timed lock to it.
+      # Only a live lock is kept: a stale own lock (its anchor pid gone, the session resumed under the same owner) is
+      # rewritten as before, so pid and expiry are fresh and nobody removes it as stale under a running command.
+      old_exp=$(info_get "$dir/info" expires); case "$old_exp" in ''|*[!0-9]*) old_exp="" ;; esac
+      if is_stale "$dir"; then old_exp=""; fi
+      if [ "$old_exp" = 0 ]; then
+        [ -z "$quiet" ] && echo "already held $res with no expiry (kept; a re-acquire never shortens a lock)"
+        return 0
+      fi
+      if [ -n "$old_exp" ] && [ "$ttl_s" != 0 ] && [ $(( old_exp - $(now) )) -gt "$ttl_s" ]; then
+        [ -z "$quiet" ] && echo "already held $res, $(( old_exp - $(now) ))s left (more than --ttl ${ttl_s}s; a re-acquire never shortens a lock, renew extends it)"
+        return 0
+      fi
       write_info "$dir" "$ttl_s" "${reason:-$(info_get "$dir/info" reason)}" || die "could not refresh $dir/info"
-      [ -z "$quiet" ] && echo "already held $res, ttl refreshed to ${ttl_s}s"
+      if [ "$ttl_s" = 0 ]; then [ -z "$quiet" ] && echo "already held $res, now with no expiry"; else [ -z "$quiet" ] && echo "already held $res, ttl refreshed to ${ttl_s}s"; fi
       return 0
     fi
     if is_stale "$dir"; then
@@ -906,7 +922,7 @@ STMTS
   exit 0
 }
 
-usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; }   # the header's last line is the AGENTLOCK_AS one; a header that grows moves this range
 # The version from the plugin manifest beside this copy: a session loads the plugin once, so a long session may run a
 # copy several releases behind the one installed; the shift reports name it to make that visible.
 cmd_version() {
