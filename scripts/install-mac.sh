@@ -109,8 +109,16 @@ fi
 echo "== guard config"
 mkdir -p "$HOME/.agentlock"
 if [ -f "$HOME/.agentlock/guard.conf" ]; then
-  echo "kept existing ~/.agentlock/guard.conf; the example's rules changed in 0.4.0 (quoted app names, osascript, xcodebuild test, simctl verbs, DeviceHub) and 0.4.1 (osascript after a pipe or redirect):"
-  echo "  compare with $(dirname "$src")/../hooks/guard.conf.example and merge your local edits into a fresh copy"
+  # Rule by rule against this version's example: a rule the example changed (the device verbs in 0.4.25) or added is
+  # named, so a kept copy does not run old rules unnoticed (an owner's copy ran 0.4.8 rules under 0.4.26).
+  ex="$(dirname "$src")/../hooks/guard.conf.example"; mine="$HOME/.agentlock/guard.conf"; differs=""; missing=""; tab=$(printf '\t')
+  while IFS="$tab" read -r name re || [ -n "$name" ]; do   # the last line counts without a trailing newline
+    case "$name" in ''|'#'*) continue ;; esac
+    m=$(awk -F'\t' -v n="$name" '$1==n {print substr($0, index($0, "\t") + 1); exit}' "$mine")
+    if [ -z "$m" ]; then missing="$missing $name"; elif [ "$m" != "$re" ]; then differs="$differs $name"; fi
+  done < "$ex"
+  if [ -z "$differs$missing" ]; then echo "kept existing ~/.agentlock/guard.conf; every rule of this version's example is in it unchanged"
+  else echo "kept existing ~/.agentlock/guard.conf; against this version's example it${differs:+ differs in:$differs;}${missing:+ lacks:$missing;} compare with $ex and merge your local edits into a fresh copy"; fi
   "$src" check-conf || echo "  fix the rules above before running agents; the guard blocks on a bad rule" >&2
 else
   cp "$(dirname "$src")/../hooks/guard.conf.example" "$HOME/.agentlock/guard.conf"

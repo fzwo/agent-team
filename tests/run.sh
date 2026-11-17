@@ -681,9 +681,21 @@ if run install; then echo "install"
   [ -d "$im/home/.agentlock/noinfo" ] && [ ! -e "$im/home/.agentlock/locks/noinfo" ] && ok "a bare directory is not migrated" || bad "bare directory migrated"
   grep -q '^expires=0$' "$im/home/.agentlock/locks/info" 2>/dev/null && ok "migration leaves the marker that protects locks/ from a pre-0.4.0 clean" || bad "no marker after migration"
   mkdir -p "$im/home/bin"; ln -sfn "$here/scripts/agentlock" "$im/home/bin/agentlock"   # the pre-wrapper link an older install left
+  # The kept guard.conf: one rule edited, one removed, one of the owner's own added; the installer names the first two.
+  python3 - "$im/home/.agentlock/guard.conf" <<'PYX'
+import sys; p=sys.argv[1]; out=[]
+for l in open(p):
+    if l.startswith("sim\t"): out.append("sim\tmy-own-sim-rule\n")
+    elif l.startswith("device\t"): continue
+    else: out.append(l)
+out.append("port:3000\tnpm run dev\n"); open(p,"w").write("".join(out))
+PYX
   out=$(HOME="$im/home" PATH="$im/bin:$PATH" bash "$here/scripts/install-mac.sh" --bin-dir "$im/link" 2>&1); check "second run: exit 0" $? 0
   [ "$(readlink "$im/home/bin/agentlock")" = "$im/home/.agentlock/agentlock" ] && printf '%s' "$out" | grep -q "repointed the older link" && ok "an older ~/bin link is repointed at the wrapper" || bad "older ~/bin link left: $(readlink "$im/home/bin/agentlock")"
   printf '%s' "$out" | grep -q "kept existing" && printf '%s' "$out" | grep -q "stub-agentlock 0.10.0 check-conf" && ok "a kept guard.conf is checked with check-conf" || bad "kept guard.conf not checked: $out"
+  printf '%s' "$out" | grep -q "kept existing ~/.agentlock/guard.conf; against this version's example it differs in: sim; lacks: device; compare with" && ok "a kept guard.conf is compared with the example rule by rule: the edited and the missing rule are named, the owner's own is not" || bad "kept conf comparison: $(printf '%s' "$out" | grep 'kept existing')"
+  cp "$here/hooks/guard.conf.example" "$im/home/.agentlock/guard.conf"
+  out=$(HOME="$im/home" PATH="$im/bin:$PATH" bash "$here/scripts/install-mac.sh" --bin-dir "$im/link" 2>&1); printf '%s' "$out" | grep -q "every rule of this version's example is in it unchanged" && ok "a kept guard.conf equal to the example is reported as such" || bad "equal conf: $(printf '%s' "$out" | grep 'kept existing')"
   # No installed copy at all: the link must still run something, and the script must say what.
   # Also no locks/ at all: the installer creates it with the marker, so the old copy's clean is safe from install time.
   rm -rf "$im/home/.claude" "$im/home/.agentlock/locks" "$im/home/.agentlock/ui"   # ui too: a legacy lock to migrate would make the old installer create locks/ itself
@@ -1031,8 +1043,8 @@ GH
   ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
   reset_stub; echo CONFLICTING > "$mg/stub/mergeable"; out=$(pm 7 2>&1); rc=$?
   [ $rc = 1 ] && printf '%s' "$out" | grep -q "CONFLICTING" && ! grep -q "pr merge" "$mg/stub/calls" && ok "merge: CONFLICTING is refused, nothing merged" || bad "conflicting: rc=$rc $out"
-  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; out=$(pm 7 --wait-mergeable 1 2>&1); rc=$?
-  [ $rc = 1 ] && printf '%s' "$out" | grep -q "still UNKNOWN after 1s" && printf '%s' "$out" | grep -q "never merge on UNKNOWN" && ! grep -q "pr merge" "$mg/stub/calls" && [ "$(cat "$mg/stub/polls")" -ge 2 ] && ok "merge: UNKNOWN that stays is refused after the wait, polled, nothing merged" || bad "unknown: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) $out"
+  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; out=$(pm 7 --wait-mergeable 2 2>&1); rc=$?   # 2 s: with a 1 s wait a second boundary once let a single poll through
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "still UNKNOWN after 2s" && printf '%s' "$out" | grep -q "never merge on UNKNOWN" && ! grep -q "pr merge" "$mg/stub/calls" && [ "$(cat "$mg/stub/polls")" -ge 2 ] && ok "merge: UNKNOWN that stays is refused after the wait, polled, nothing merged" || bad "unknown: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) $out"
   reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; echo 3 > "$mg/stub/flip-at"; out=$(pm 7 --wait-mergeable 30 2>&1); rc=$?
   hs=$(git -C "$mg/co" rev-parse origin/feature)
   [ $rc = 0 ] && [ "$(cat "$mg/stub/polls")" -ge 3 ] && [ "$(cat "$mg/stub/merge-call")" = "pr merge 7 --merge --match-head-commit $hs" ] && printf '%s' "$out" | grep -q "merged #7 (feature into main, merge), shown MERGED" && printf '%s' "$out" | grep -q "Next: pr-cleanup.sh 7" && ok "merge: UNKNOWN that turns MERGEABLE is merged once it does, naming the head commit checked, MERGED confirmed, next steps printed" || bad "flip: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) call=$(cat "$mg/stub/merge-call" 2>/dev/null) $out"
@@ -1051,17 +1063,26 @@ GH
   reset_stub; out=$(pm 7 --method squash 2>&1); rc=$?
   [ $rc = 0 ] && grep -q -- "^pr merge 7 --squash --match-head-commit" "$mg/stub/merge-call" && printf '%s' "$out" | grep -q "(feature into main, squash)" && ok "merge: --method squash is passed through" || bad "squash: rc=$rc $(cat "$mg/stub/merge-call" 2>/dev/null) $out"
   pm 7 --method fast >/dev/null 2>&1; check "merge: an unknown --method is a usage error, exit 2" $? 2
+  # The dry run runs the check after the wait too: the base moves during the wait, the dry run refuses like the real run.
+  ( cd "$mg/other" && gitm pull -q --ff-only origin main )
+  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; echo 2 > "$mg/stub/flip-at"; printf 'cd %s && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m base5 && git push -q origin HEAD:main\n' "$mg/other" > "$mg/stub/on-first-poll"
+  out=$(pm 7 --dry-run --wait-mergeable 30 2>&1); rc=$?
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s)" && [ ! -f "$mg/stub/merge-call" ] && ok "merge: --dry-run runs the check after the wait too" || bad "dry run after wait: rc=$rc $out"
+  ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
+  reset_stub; out=$(pm 7 --dry-run 2>&1); rc=$?
+  [ $rc = 0 ] && printf '%s' "$out" | grep -q "dry run: #7 (feature into main, merge) would merge at $(git -C "$mg/co" rev-parse origin/feature); every check passed, nothing merged" && [ ! -f "$mg/stub/merge-call" ] && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: --dry-run on a current PR passes every check, says what would merge, merges nothing" || bad "dry run: rc=$rc $out"
   [ -z "$(git -C "$mg/co" for-each-ref refs/pr-merge)" ] && ok "merge: the script's own refs are gone after its runs, refused and merged alike" || bad "refs left: $(git -C "$mg/co" for-each-ref refs/pr-merge)"
   # A behind PR is refused before any mergeability poll: the first check is the fast path.
   ( cd "$mg/other" && gitm pull -q --ff-only origin main && gitm commit -q --allow-empty -m base4 && gitm push -q origin HEAD:main )
-  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; out=$(pm 7 --wait-mergeable 1 2>&1); rc=$?
+  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; out=$(pm 7 --wait-mergeable 2 2>&1); rc=$?   # 2 s: with a 1 s wait a second boundary once let a single poll through
   [ $rc = 1 ] && [ ! -f "$mg/stub/polls" ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s)" && ok "merge: a behind PR is refused before mergeability is polled" || bad "fast path: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) $out"
+  reset_stub; pm 7 --dry-run >/dev/null 2>&1; check "merge: --dry-run on a behind PR exits 1 like the real run" $? 1
   ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
   reset_stub; : > "$mg/stub/merge-fails"; out=$(pm 7 2>&1); rc=$?
   [ $rc = 1 ] && printf '%s' "$out" | grep -q "gh pr merge refused #7; nothing was merged. Do not close the issue" && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: a refused gh pr merge exits 1 and says not to close the issue" || bad "merge refused: rc=$rc $out"
   pm x >/dev/null 2>&1; check "merge: a non-numeric PR is a usage error, exit 2" $? 2
   pm 7 --bogus >/dev/null 2>&1; check "merge: an unknown option is a usage error, exit 2" $? 2
-  h=$(bash "$here/scripts/pr-merge.sh" --help); printf '%s' "$h" | grep -q -- '--wait-mergeable' && [ "$(printf '%s' "$h" | tail -1)" = "PR_MERGE_POLL (seconds between checks, default 5) is for the tests." ] && ok "merge: --help prints the whole header" || bad "merge --help: $(printf '%s' "$h" | tail -1)"
+  h=$(bash "$here/scripts/pr-merge.sh" --help); printf '%s' "$h" | grep -q -- '--wait-mergeable' && [ "$(printf '%s' "$h" | tail -1)" = "so the script can be tried on a live PR. PR_MERGE_POLL (seconds between checks, default 5) is for the tests." ] && ok "merge: --help prints the whole header" || bad "merge --help: $(printf '%s' "$h" | tail -1)"
 fi
 
 if run publish; then echo "publish"

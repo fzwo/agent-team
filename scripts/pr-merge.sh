@@ -1,6 +1,6 @@
 #!/bin/bash
 # Merge a PR only when it is safe to: GitHub knows it is mergeable, and the branch holds the base it lands on.
-#   pr-merge.sh <pr-number> [--wait-mergeable 90] [--method merge|squash|rebase]
+#   pr-merge.sh <pr-number> [--wait-mergeable 90] [--method merge|squash|rebase] [--dry-run]
 # Refuses (exit 1) when the PR is not OPEN; when the base branch has commits the PR's head does not (two PRs each
 # reviewed clean against an older main once broke main for an hour: one added an exhaustive switch, the other an
 # enum case; merge the base into the branch, rerun the build and the tests the PR touches, push, run this again);
@@ -13,16 +13,18 @@
 # closing the issue comes after MERGED, by hand or by the cleanup. Run it from the project checkout; it fetches
 # the base and the head from origin into refs of its own (refs/pr-merge/<pr>/, removed when it exits), so the
 # clone's refspec does not matter and two runs for two PRs in one repository do not mix.
-# PR_MERGE_POLL (seconds between checks, default 5) is for the tests.
+# --dry-run runs every check and the wait, prints what would merge and exits 0 without merging (exit 1 on a refusal),
+# so the script can be tried on a live PR. PR_MERGE_POLL (seconds between checks, default 5) is for the tests.
 set -eu
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
 pr="${1:-}"; shift || true
-case "$pr" in -h|--help) usage; exit 0 ;; ''|*[!0-9]*) echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase]" >&2; exit 2 ;; esac
-wait_m=90; method=merge
+case "$pr" in -h|--help) usage; exit 0 ;; ''|*[!0-9]*) echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run]" >&2; exit 2 ;; esac
+wait_m=90; method=merge; dry=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --wait-mergeable) wait_m="${2:-}"; case "$wait_m" in ''|*[!0-9]*) echo "--wait-mergeable needs a number of seconds" >&2; exit 2 ;; esac; shift 2 ;;
     --method) method="${2:-}"; case "$method" in merge|squash|rebase) ;; *) echo "--method is merge, squash or rebase" >&2; exit 2 ;; esac; shift 2 ;;
+    --dry-run) dry=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -57,6 +59,7 @@ while :; do
 done
 refresh   # the base may have moved while we waited: the shift's case was two merges minutes apart
 head_sha=$(git rev-parse "$rh")
+if [ -n "$dry" ]; then echo "dry run: #$pr ($head into $base, $method) would merge at $head_sha; every check passed, nothing merged."; exit 0; fi
 gh pr merge "$pr" "--$method" --match-head-commit "$head_sha" || { echo "pr-merge.sh: gh pr merge refused #$pr; nothing was merged. Do not close the issue; read the message above (a head pushed since the check, a merge method the repository does not allow, a conflict)." >&2; exit 1; }
 deadline=$(( $(date +%s) + 60 ))
 while :; do
