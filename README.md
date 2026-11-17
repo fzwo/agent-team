@@ -16,7 +16,7 @@ It grew out of one iOS project (about 300 merged PRs in three weeks). `ASSESSMEN
 | `hooks/hooks.json` | Lock enforcement on every shell command, lock owner export at session start, lock release at session end |
 | `scripts/agentlock` | The machine-wide lock |
 | `scripts/watch-github.py` | Polls GitHub for input addressed to a role and wakes a session; no tokens while waiting |
-| `scripts/gh-labels.sh`, `changelog-new.sh`, `changelog-render.sh`, `pr-cleanup.sh` | Labels, changelog entries, the rendered changelog view, cleanup that checks MERGED first and runs the project's worktree hook |
+| `scripts/gh-labels.sh`, `changelog-new.sh`, `changelog-render.sh`, `pr-merge.sh`, `pr-cleanup.sh` | Labels, changelog entries, the rendered changelog view, a merge that refuses while main has moved past the branch or GitHub has not computed mergeability, cleanup that checks MERGED first and runs the project's worktree hook |
 | `scripts/install-mac.sh`, `host-add.sh`, `shift-start.sh` | Mac setup, a launchd host per project folder, a named shift from the command line |
 | `scripts/tmp-sweep.sh` | counts, and with `--delete` removes, known toolchain debris in the Mac's temporary directory (SwiftPM and Interface Builder leftovers and Instruments trace bundles, which macOS clears only at reboot) |
 | `scripts/publish.sh`, `publish-subs.py` | the maintainer's release step: the private repository's HEAD, rewritten for the public copy, as one commit per version in the public install source; the list of names and its test fixture are kept out of the public copy, where the script refuses to run |

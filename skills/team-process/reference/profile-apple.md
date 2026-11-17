@@ -15,12 +15,14 @@ Project-specific values (simulator model, board size, device names, languages, t
 
 | Resource | Taken for |
 |---|---|
-| `sim:<name>` | Booting, installing on, launching in, screenshotting, or recording a simulator, and `xcodebuild test` runs on a simulator-family destination, which boot one. One simulator at a time per session; shut it down when done |
+| `sim:<name>` | Booting, installing on, launching in, screenshotting, or recording a simulator, and `xcodebuild test` runs on a simulator-family destination, which boot one. One simulator at a time per session; shut it down when done. Hosted unit tests may run on any idle simulator under its own `sim:<name>` lock (a second device on the machine took a shift's unit-test load off the board's simulator); on-screen checks belong on the board's simulator |
 | `device:<udid>` | Anything on a physical device: install, launch, logs, screenshots, and `xcodebuild test` runs with a device destination (which take `sim` as well, since the rule cannot tell the two platforms apart after the quote cut) |
 | `ui` | Anything that takes the screen or keyboard focus from the owner: screen recording, driving the simulator window or a macOS app window, `osascript`, the Accessibility Inspector. A headless `xcodebuild test` on a simulator does not; it takes `sim`. A macOS test run (`platform=macOS`) drives a window and takes `ui` alone |
 | `quiet` | A measurement that needs the machine to itself: performance, memory, battery, timing, background-task behaviour. Waits for every other lock, then blocks everyone else's heavy work until released, the holder's sibling builders included; the holder runs the measured commands as `AGENTLOCK_AS=<name> agentlock with quiet -- <command>` |
 
-The hook config (`guard.conf`) maps `simctl`, `devicectl`, `screencapture`, `xcodebuild test` and the like to these. Take the lock with a reason and a TTL that covers the whole step. Shut the simulator down and release before the report.
+The hook config (`guard.conf`) maps `simctl`, `devicectl`, `screencapture`, `xcodebuild test` and the like to these. Take the lock with a reason and a TTL that covers the whole step, a UI test's time allowance included: a hung UI test once retried its interruption handler for 39 minutes, the lock lapsed under it, and another agent took the simulator while it was still being driven. Give UI tests an `executionTimeAllowance` and run them with `-test-timeouts-enabled YES` (Xcode 27.2, 2026-11). Shut the simulator down and release before the report.
+
+Under load, timing tests lie about PRs: with four to six agents running `xcodebuild test`, load averages of 300 to 470 made real-time audio tests fail in every review round of PRs that did not touch audio. Before attributing a timing-test failure to a PR, rerun it under `agentlock with quiet` on `main` and on the branch (three minutes, in that shift): a failure on both is the load, a failure on the branch alone is the PR.
 
 ## Devices
 

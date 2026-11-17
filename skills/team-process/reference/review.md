@@ -46,7 +46,7 @@ Case 2 includes the count staying at one: four rounds of one finding each, every
 
 ## Merging
 
-- Merge without asking once a round is clean, using `gh pr merge --squash --auto` or the repo's convention. Check the PR state before any cleanup (`pr-cleanup.sh`).
+- Merge without asking once a round is clean, with `pr-merge.sh <number>` (`--method squash` where that is the repo's convention): it refuses while `main` has moved past the branch or GitHub has not computed mergeability, and confirms MERGED. Check the PR state before any cleanup (`pr-cleanup.sh`).
 - Stop and file an `owner` issue instead when a finding needs a product call, a fix is risky or cannot be verified by observation, or the merge conflicts with `main` in a way that needs judgement.
 - After the merge: the closing comment on the issue names the design-doc sections that no longer match the build, or says none do.
 

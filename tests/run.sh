@@ -2,7 +2,7 @@
 # Regression suite for the plugin's scripts. Runs anywhere with bash, python3, jq and git;
 # needs no GitHub (gh is stubbed) and touches nothing outside a scratch directory.
 #   tests/run.sh            run everything
-#   tests/run.sh lock       one group: lock | guard | watcher | cleanup | changelog | install | shift | sweep | publish
+#   tests/run.sh lock       one group: lock | guard | watcher | cleanup | changelog | install | shift | sweep | publish | merge
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 # The caller's environment must not leak into the scripts under test.
@@ -20,7 +20,7 @@ ok()   { pass=$((pass+1)); echo "  ok   $1"; }
 bad()  { fail=$((fail+1)); echo "  FAIL $1" >&2; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; fi; }
 want="${1:-all}"
-case "$want" in all|lock|guard|watcher|cleanup|changelog|install|shift|sweep|publish) ;; *) echo "unknown group: $want (lock|guard|watcher|cleanup|changelog|install|shift|sweep|publish)" >&2; exit 2 ;; esac
+case "$want" in all|lock|guard|watcher|cleanup|changelog|install|shift|sweep|publish|merge) ;; *) echo "unknown group: $want (lock|guard|watcher|cleanup|changelog|install|shift|sweep|publish|merge)" >&2; exit 2 ;; esac
 run() { [ "$want" = all ] || [ "$want" = "$1" ]; }
 
 if run lock; then echo "lock"
@@ -994,6 +994,74 @@ if run sweep; then echo "sweep"
   bash "$here/scripts/tmp-sweep.sh" --delete "$work/sweep/nowhere" >/dev/null 2>&1; check "sweep: a missing directory is a bad call, exit 2" $? 2
   TMPDIR= bash "$here/scripts/tmp-sweep.sh" >/dev/null 2>&1; check "sweep: no TMPDIR and no argument is a bad call, exit 2" $? 2
   h=$(bash "$here/scripts/tmp-sweep.sh" --help); printf '%s' "$h" | grep -q -- '--age-hours' && [ "$(printf '%s' "$h" | tail -1)" = "are not debris; the project's worktree hook removes those." ] && ok "sweep: --help prints the whole header" || bad "sweep --help: $(printf '%s' "$h" | tail -1)"
+fi
+
+if run merge; then echo "merge"
+  # pr-merge.sh: refuses while main has moved past the branch, while GitHub has not computed mergeability or reports a
+  # conflict; merges, waits for MERGED, prints the next steps. gh is a stub driven by files; git is a real repo with an origin.
+  mg="$work/merge"; mkdir -p "$mg/bin" "$mg/stub"; gitm() { git -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
+  cat > "$mg/bin/gh" <<'GH'
+#!/bin/bash
+d="$STUB"; echo "$*" >> "$d/calls"
+case "$*" in
+  "pr view "*"--json state"*) if [ -f "$d/state-reads" ]; then r=$(( $(cat "$d/state-reads") + 1 )); echo $r > "$d/state-reads"; [ -f "$d/merged-visible-at" ] && [ "$r" -lt "$(cat "$d/merged-visible-at")" ] && { echo OPEN; exit 0; }; fi; cat "$d/state" ;;
+  "pr view "*"--json baseRefName"*) echo main ;;
+  "pr view "*"--json headRefName"*) echo feature ;;
+  "pr view "*"--json mergeable"*) n=$(cat "$d/polls" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$d/polls"
+    [ "$n" = 1 ] && [ -f "$d/on-first-poll" ] && . "$d/on-first-poll"   # the world moves while the script waits
+    [ -f "$d/err-at" ] && [ "$n" = "$(cat "$d/err-at")" ] && { echo "HTTP 502 Bad Gateway" >&2; exit 1; }
+    if [ -f "$d/flip-at" ] && [ "$n" -ge "$(cat "$d/flip-at")" ]; then echo MERGEABLE; else cat "$d/mergeable"; fi ;;
+  "pr merge "*) if [ -f "$d/merge-fails" ]; then echo "GraphQL: Pull Request is not mergeable" >&2; exit 1; fi; echo "$*" > "$d/merge-call"; echo MERGED > "$d/state"; echo 0 > "$d/state-reads"; echo merged ;;
+  *) echo "stub gh: $*" >&2; exit 1 ;;
+esac
+GH
+  chmod +x "$mg/bin/gh"
+  git init -q --bare "$mg/origin.git" && git -C "$mg/origin.git" symbolic-ref HEAD refs/heads/main
+  gitm clone -q "$mg/origin.git" "$mg/co" 2>/dev/null; ( cd "$mg/co" && gitm commit -q --allow-empty -m base1 && gitm push -q origin HEAD:main && gitm checkout -q -b feature && gitm commit -q --allow-empty -m f1 && gitm push -q origin feature && gitm checkout -q main )
+  gitm clone -q "$mg/origin.git" "$mg/other" 2>/dev/null   # another agent's clone: its pushes are not in co's origin/* until fetched
+  reset_stub() { rm -f "$mg/stub/"*; echo OPEN > "$mg/stub/state"; echo MERGEABLE > "$mg/stub/mergeable"; }
+  pm() { ( cd "$mg/co" && STUB="$mg/stub" PR_MERGE_POLL=0 PATH="$mg/bin:$PATH" bash "$here/scripts/pr-merge.sh" "$@" ); }
+  reset_stub; echo MERGED > "$mg/stub/state"; pm 7 >/dev/null 2>&1; check "merge: a PR that is not OPEN is refused, exit 1" $? 1
+  reset_stub; echo CLOSED > "$mg/stub/state"; out=$(pm 7 2>&1); printf '%s' "$out" | grep -q "is CLOSED, not OPEN" && ! grep -q "pr merge" "$mg/stub/calls" && ok "merge: a closed PR: the message says so and nothing is merged" || bad "closed PR: $out"
+  # main moves past the branch: refused with the instruction; no merge call.
+  ( cd "$mg/other" && gitm pull -q --ff-only origin main && gitm commit -q --allow-empty -m base2 && gitm push -q origin HEAD:main )
+  reset_stub; out=$(pm 7 2>&1); rc=$?
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s) that #7 (feature) does not. Merge main into feature, rerun the build and the tests the PR touches" && ! grep -q "pr merge" "$mg/stub/calls" && ok "merge: main moved past the branch: refused with the instruction, nothing merged" || bad "main moved: rc=$rc $out"
+  # the branch takes main in: the check passes
+  ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
+  reset_stub; echo CONFLICTING > "$mg/stub/mergeable"; out=$(pm 7 2>&1); rc=$?
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "CONFLICTING" && ! grep -q "pr merge" "$mg/stub/calls" && ok "merge: CONFLICTING is refused, nothing merged" || bad "conflicting: rc=$rc $out"
+  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; out=$(pm 7 --wait-mergeable 1 2>&1); rc=$?
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "still UNKNOWN after 1s" && printf '%s' "$out" | grep -q "never merge on UNKNOWN" && ! grep -q "pr merge" "$mg/stub/calls" && [ "$(cat "$mg/stub/polls")" -ge 2 ] && ok "merge: UNKNOWN that stays is refused after the wait, polled, nothing merged" || bad "unknown: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) $out"
+  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; echo 3 > "$mg/stub/flip-at"; out=$(pm 7 --wait-mergeable 30 2>&1); rc=$?
+  hs=$(git -C "$mg/co" rev-parse origin/feature)
+  [ $rc = 0 ] && [ "$(cat "$mg/stub/polls")" -ge 3 ] && [ "$(cat "$mg/stub/merge-call")" = "pr merge 7 --merge --match-head-commit $hs" ] && printf '%s' "$out" | grep -q "merged #7 (feature into main, merge), shown MERGED" && printf '%s' "$out" | grep -q "Next: pr-cleanup.sh 7" && ok "merge: UNKNOWN that turns MERGEABLE is merged once it does, naming the head commit checked, MERGED confirmed, next steps printed" || bad "flip: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) call=$(cat "$mg/stub/merge-call" 2>/dev/null) $out"
+  # The base moves while the script waits for mergeability: the check after the wait refuses; nothing merged.
+  ( cd "$mg/other" && gitm pull -q --ff-only origin main )
+  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; echo 2 > "$mg/stub/flip-at"; printf 'cd %s && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m base3 && git push -q origin HEAD:main\n' "$mg/other" > "$mg/stub/on-first-poll"
+  out=$(pm 7 --wait-mergeable 30 2>&1); rc=$?
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s) that #7 (feature) does not" && [ ! -f "$mg/stub/merge-call" ] && ok "merge: a base that moves during the wait is caught by the check after it, nothing merged" || bad "moved during wait: rc=$rc $out"
+  ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
+  # A gh error while polling counts as unknown until the deadline, not as a crash.
+  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; echo 1 > "$mg/stub/err-at"; echo 2 > "$mg/stub/flip-at"; out=$(pm 7 --wait-mergeable 30 2>&1); rc=$?
+  [ $rc = 0 ] && ok "merge: a gh error on a poll is waited out like UNKNOWN" || bad "gh error on poll: rc=$rc $out"
+  # MERGED shows only on the third state read after the merge: the script waits for it.
+  reset_stub; echo 3 > "$mg/stub/merged-visible-at"; out=$(pm 7 2>&1); rc=$?
+  [ $rc = 0 ] && [ "$(cat "$mg/stub/state-reads")" -ge 3 ] && printf '%s' "$out" | grep -q "shown MERGED" && ok "merge: MERGED is polled for, not assumed" || bad "merged poll: rc=$rc reads=$(cat "$mg/stub/state-reads" 2>/dev/null) $out"
+  reset_stub; out=$(pm 7 --method squash 2>&1); rc=$?
+  [ $rc = 0 ] && grep -q -- "^pr merge 7 --squash --match-head-commit" "$mg/stub/merge-call" && printf '%s' "$out" | grep -q "(feature into main, squash)" && ok "merge: --method squash is passed through" || bad "squash: rc=$rc $(cat "$mg/stub/merge-call" 2>/dev/null) $out"
+  pm 7 --method fast >/dev/null 2>&1; check "merge: an unknown --method is a usage error, exit 2" $? 2
+  [ -z "$(git -C "$mg/co" for-each-ref refs/pr-merge)" ] && ok "merge: the script's own refs are gone after its runs, refused and merged alike" || bad "refs left: $(git -C "$mg/co" for-each-ref refs/pr-merge)"
+  # A behind PR is refused before any mergeability poll: the first check is the fast path.
+  ( cd "$mg/other" && gitm pull -q --ff-only origin main && gitm commit -q --allow-empty -m base4 && gitm push -q origin HEAD:main )
+  reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; out=$(pm 7 --wait-mergeable 1 2>&1); rc=$?
+  [ $rc = 1 ] && [ ! -f "$mg/stub/polls" ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s)" && ok "merge: a behind PR is refused before mergeability is polled" || bad "fast path: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) $out"
+  ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
+  reset_stub; : > "$mg/stub/merge-fails"; out=$(pm 7 2>&1); rc=$?
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "gh pr merge refused #7; nothing was merged. Do not close the issue" && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: a refused gh pr merge exits 1 and says not to close the issue" || bad "merge refused: rc=$rc $out"
+  pm x >/dev/null 2>&1; check "merge: a non-numeric PR is a usage error, exit 2" $? 2
+  pm 7 --bogus >/dev/null 2>&1; check "merge: an unknown option is a usage error, exit 2" $? 2
+  h=$(bash "$here/scripts/pr-merge.sh" --help); printf '%s' "$h" | grep -q -- '--wait-mergeable' && [ "$(printf '%s' "$h" | tail -1)" = "PR_MERGE_POLL (seconds between checks, default 5) is for the tests." ] && ok "merge: --help prints the whole header" || bad "merge --help: $(printf '%s' "$h" | tail -1)"
 fi
 
 if run publish; then echo "publish"
