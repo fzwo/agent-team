@@ -21,7 +21,10 @@ about how fast a quiet agent notices the other one waking up.
 Addressed to role R means: a comment or issue whose first line is not R's own
 tag (so the other agent's tag, or no tag, which is the owner). A pull request is
 listed when it appears or carries R's label; the other role's PRs only when
-labelled for R; an item R itself bumped last is not listed again. Agent comments on
+labelled for R; an item R itself bumped last is not listed again, nor one R
+routed to the other role (R's comment newest in the tick, the other role's label on
+it, not R's; a label edit a tick later than the comment is listed, since the comment
+is behind the cursor by then). Agent comments on
 issues labelled `idea` are skipped; the owner's are not. Inline review comments
 on PR diffs are included. The cursor and the seen ids live in the state
 directory, so a restart does not replay old items; a start without a cursor (a
@@ -246,6 +249,12 @@ def main():
             # comment moves updated_at past it and wakes here.
             ob = own_bumped.get(i["number"])
             if (known or i.get("created_at", "") < since) and ob and ob[1] and i["updated_at"] <= ob[0]:
+                continue
+            # Our own routing: the newest comment is ours and the issue carries the other role's label and not ours (we
+            # labelled it after commenting, which bumped it past our comment). The other role's answer wakes us through
+            # the comment list; the owner relabelling it for us puts our label on it. A session once woke on its own label edit.
+            other = [r for r in TAGS if r != a.role][0]
+            if (known or i.get("created_at", "") < since) and ob and ob[1] and f"for-{other}" in labels.split(",") and f"for-{a.role}" not in labels.split(","):
                 continue
             items.append(f"- #{i['number']} {kind} by {who(i.get('body'))}, {i['state']}, labels: {labels or '-'}: {i['title']}")
         for c in comments:
