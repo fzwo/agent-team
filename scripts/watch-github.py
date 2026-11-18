@@ -25,7 +25,8 @@ labelled for R; an item R itself bumped last is not listed again, nor one R
 routed to the other role (R's comment newest in the tick, the other role's label on
 it, not R's; a label edit a tick later than the comment is listed, since the comment
 is behind the cursor by then). Agent comments on
-issues labelled `idea` are skipped; the owner's are not. Inline review comments
+issues labelled `idea` are skipped; the owner's are not. An owner's `decision`
+issue addressed to no role wakes on its opening and its comments, not its edits. Inline review comments
 on PR diffs are included. The cursor and the seen ids live in the state
 directory, so a restart does not replay old items; a start without a cursor (a
 first run, a fresh container) lists the last --catch-up-hours, so the previous
@@ -249,6 +250,10 @@ def main():
             # comment moves updated_at past it and wakes here.
             ob = own_bumped.get(i["number"])
             if (known or i.get("created_at", "") < since) and ob and ob[1] and i["updated_at"] <= ob[0]:
+                continue
+            # An owner's `decision` issue addressed to no role (no for-<role> label) is the owner's list; its edits are not
+            # input (a naming list woke a session three times). Its opening is listed, as an idea's is, and its comments are.
+            if "decision" in labels.split(",") and first_line_tag(i.get("body")) is None and not any(f"for-{r}" in labels.split(",") for r in TAGS) and (known or i.get("created_at", "") < since):
                 continue
             # Our own routing: the newest comment is ours and the issue carries the other role's label and not ours (we
             # labelled it after commenting, which bumped it past our comment). The other role's answer wakes us through

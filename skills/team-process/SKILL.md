@@ -103,6 +103,8 @@ Two needs are different and have different locks. Driving the UI needs the scree
 
 ## Subagents
 
+A builder writes its report to a file before it hands back (the brief names the path; the default is `report.md` in the builder's scratch directory); when a hand-back is refused or does not arrive, read that file instead of the branch.
+
 Check free disk against the profile's floor before each builder you launch, not only at the start of the shift (one simulator cache grew 27 GB in fourteen hours of test runs). A "finished" notification for a resumed builder may belong to its earlier run; before doing a resumed builder's task yourself (opening its PR), look at the branch and the PR list, since a race there once made two PRs. Reviewer (`agent-team:reviewer`), builder (`agent-team:builder`) and design critic (`agent-team:design-critic`) briefs are in the plugin. What every builder of the project needs to know (lock names, `--wait` limits, the disk floor, build folders, attribution lines, content rules for screenshots, the simulator recipe) lives once in `.agent-team/builder-brief.md`, which builders read first; the per-task brief carries the task, the branch, the worktree, the lock name for this builder and the verification. Every brief you write yourself still includes: delete only your own files, by exact name, never by pattern; delete your own large scratch items (built apps, videos, traces, benchmark data) when the piece of work merges; keep your worktree until your PR merges; report evidence, not conclusions.
 
 ## Sessions and state

@@ -1,9 +1,11 @@
 #!/bin/bash
 # Merge a PR only when it is safe to: GitHub knows it is mergeable, and the branch holds the base it lands on.
-#   pr-merge.sh <pr-number> [--wait-mergeable 90] [--method merge|squash|rebase] [--dry-run]
+#   pr-merge.sh <pr-number> [--wait-mergeable 90] [--method merge|squash|rebase] [--dry-run] [--strict]
 # Refuses (exit 1) when the PR is not OPEN; when the base branch has commits the PR's head does not (two PRs each
 # reviewed clean against an older main once broke main for an hour: one added an exhaustive switch, the other an
-# enum case; merge the base into the branch, rerun the build and the tests the PR touches, push, run this again);
+# enum case; merge the base into the branch, rerun the build and the tests the PR touches, push, run this again),
+# unless every file those commits touch is a document (`*.md`, `.agent-team/`, `design/`, `docs/`), which cannot
+# change a build (a shift was refused six times for state-file and design-doc commits); --strict refuses those too;
 # when GitHub reports CONFLICTING; and when mergeability is still UNKNOWN after --wait-mergeable seconds (GitHub
 # computes it lazily after a push; never merge on UNKNOWN; an error from gh counts as unknown until then). The base
 # check runs again after the wait, since the base can move during it, and the merge names the head commit it
@@ -18,21 +20,22 @@
 # removed on exit): run it from your shift's checkout, not a shared one. PR_MERGE_POLL (seconds between checks,
 # default 5) is for the tests.
 set -eu
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
 # The PR number and the options in any order (`--dry-run 1141` and `1141 --dry-run` both work; the first form was a usage error once).
-pr=""; wait_m=90; method=merge; dry=""
+pr=""; wait_m=90; method=merge; dry=""; strict=""; noted=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --wait-mergeable) wait_m="${2:-}"; case "$wait_m" in ''|*[!0-9]*) echo "--wait-mergeable needs a number of seconds" >&2; exit 2 ;; esac; shift 2 ;;
     --method) method="${2:-}"; case "$method" in merge|squash|rebase) ;; *) echo "--method is merge, squash or rebase" >&2; exit 2 ;; esac; shift 2 ;;
     --dry-run) dry=1; shift ;;
+    --strict) strict=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
-    *) case "$1" in *[!0-9]*) echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run]" >&2; exit 2 ;; esac
+    *) case "$1" in *[!0-9]*) echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run] [--strict]" >&2; exit 2 ;; esac
        [ -z "$pr" ] || { echo "pr-merge.sh: one PR number, not two ($pr and $1)" >&2; exit 2; }; pr="$1"; shift ;;
   esac
 done
-[ -n "$pr" ] || { echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run]" >&2; exit 2; }
+[ -n "$pr" ] || { echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run] [--strict]" >&2; exit 2; }
 poll="${PR_MERGE_POLL:-5}"
 state=$(gh pr view "$pr" --json state -q .state) || { echo "pr-merge.sh: cannot read #$pr" >&2; exit 1; }
 [ "$state" = OPEN ] || { echo "pr-merge.sh: #$pr is ${state:-unreadable}, not OPEN; nothing to merge" >&2; exit 1; }
@@ -47,8 +50,21 @@ refresh() {
     || { echo "pr-merge.sh: cannot fetch $base and $head from origin; run this from the project checkout" >&2; exit 1; }
   behind=$(git rev-list --count "$rh..$rb")
   if [ "$behind" -gt 0 ]; then
-    echo "pr-merge.sh: refusing: origin/$base has $behind commit(s) that #$pr ($head) does not. Merge $base into $head, rerun the build and the tests the PR touches, push, then run this again. (Two PRs each clean against an older $base once broke it.)" >&2
-    exit 1
+    # Documents cannot change a build: when every file the missing commits touch is one, the merge goes on and says so.
+    # No rename detection (a code file moved into docs/ would show under its new name only) and no path quoting.
+    files=$(git -c core.quotePath=off diff --no-renames --name-only "$rh...$rb" --)
+    code=$(printf '%s\n' "$files" | grep -Ev '^$|(^|/)[^/]*\.md$|^\.agent-team/|^design/|^docs/' || true)
+    shown=$(printf '%s\n' "$files" | tr '\n' ' ' | sed 's/ $//'); [ -n "$shown" ] || shown="no files"
+    if [ -n "$code" ]; then
+      echo "pr-merge.sh: refusing: origin/$base has $behind commit(s) that #$pr ($head) does not, touching code ($(printf '%s\n' "$code" | head -1)$( [ "$(printf '%s\n' "$code" | grep -c .)" -gt 1 ] && printf ' …' )). Merge $base into $head, rerun the build and the tests the PR touches, push, then run this again. (Two PRs each clean against an older $base once broke it.)" >&2
+      exit 1
+    fi
+    if [ -n "$strict" ]; then
+      echo "pr-merge.sh: refusing under --strict: origin/$base has $behind commit(s) that #$pr ($head) does not, touching documents only ($shown). Merge $base into $head, push, then run this again." >&2
+      exit 1
+    fi
+    [ -n "$noted" ] || echo "note: origin/$base has $behind commit(s) that #$pr ($head) does not, touching documents only ($shown); going on, since a document cannot change a build (--strict refuses this too)."
+    noted=1
   fi
 }
 refresh
