@@ -63,7 +63,7 @@ while :; do
 done
 refresh   # the base may have moved while we waited: the shift's case was two merges minutes apart
 head_sha=$(git rev-parse "$rh")
-if [ -n "$dry" ]; then echo "dry run: #$pr ($head into $base, $method) would merge at $head_sha; every check passed, nothing merged."; exit 0; fi
+if [ -n "$dry" ]; then echo "dry run: #$pr ($head into $base, $method) would merge at $head_sha if the head is unchanged by then; every check passed, nothing merged."; exit 0; fi
 gh pr merge "$pr" "--$method" --match-head-commit "$head_sha" || { echo "pr-merge.sh: gh pr merge refused #$pr; nothing was merged. Do not close the issue; read the message above (a head pushed since the check, a merge method the repository does not allow, a conflict)." >&2; exit 1; }
 deadline=$(( $(date +%s) + 60 ))
 while :; do

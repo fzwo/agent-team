@@ -1175,7 +1175,7 @@ GH
   [ $rc = 1 ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s)" && [ ! -f "$mg/stub/merge-call" ] && ok "merge: --dry-run runs the check after the wait too" || bad "dry run after wait: rc=$rc $out"
   ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
   reset_stub; out=$(pm 7 --dry-run 2>&1); rc=$?
-  [ $rc = 0 ] && printf '%s' "$out" | grep -q "dry run: #7 (feature into main, merge) would merge at $(git -C "$mg/co" rev-parse origin/feature); every check passed, nothing merged" && [ ! -f "$mg/stub/merge-call" ] && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: --dry-run on a current PR passes every check, says what would merge, merges nothing" || bad "dry run: rc=$rc $out"
+  [ $rc = 0 ] && printf '%s' "$out" | grep -q "dry run: #7 (feature into main, merge) would merge at $(git -C "$mg/co" rev-parse origin/feature) if the head is unchanged by then; every check passed, nothing merged" && [ ! -f "$mg/stub/merge-call" ] && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: --dry-run on a current PR passes every check, says what would merge, merges nothing" || bad "dry run: rc=$rc $out"
   [ -z "$(git -C "$mg/co" for-each-ref refs/pr-merge)" ] && ok "merge: the script's own refs are gone after its runs, refused and merged alike" || bad "refs left: $(git -C "$mg/co" for-each-ref refs/pr-merge)"
   # A behind PR is refused before any mergeability poll: the first check is the fast path.
   ( cd "$mg/other" && gitm pull -q --ff-only origin main && gitm commit -q --allow-empty -m base4 && gitm push -q origin HEAD:main )

@@ -30,6 +30,7 @@ One report, when you are done: the hand-back is the channel, and a second report
 - Hand back only when nothing you started is still running: wait for or stop every background command first. A hand-back with work still running sends the session a notice per remaining job, five to eight per builder in one shift, and the session cannot tell them from your report.
 - Spell a deletion with a literal path where you can (`cd <dir> && rm -rf ./<name>`): the harness's own check refuses `rm -rf` of a path built from a variable even as `"$dir/${name:?}"`, and each refusal costs a retry.
 - Delete only files you created, by exact name, never by pattern. Never remove build folders, worktrees, branches or scratch files that are not yours. When your PR merges, delete your own large scratch items by exact name: copies of built apps, screen videos, traces, benchmark data. Keep phone and database backups until the device work that needed them is finished.
+- When the project's CLAUDE.md names toolchain skills for your area (SwiftUI, App Intents, Instruments on an Apple project), read the matching one before you start; it supersedes what you remember about that API.
 - A lock's TTL covers the whole step, a UI test's time allowance included; a lock that lapses under a running test hands the simulator to someone else while you still drive it.
 - Keep your worktree until your PR shows MERGED; the review fixes happen in it.
 - Keep the profile's disk floor free (your brief names it); if a build would break that, stop and say so.

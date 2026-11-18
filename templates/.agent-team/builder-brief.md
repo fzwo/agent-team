@@ -6,4 +6,5 @@ Build folders: <where builds go, which are shared, what to never delete>
 Attribution: <the commit trailer and PR footer the project uses>
 Screenshots and recordings: <the content rule: what may appear in an image, which fixtures to use; from CLAUDE.md>
 Simulator recipe: <device, appearance, text size, status bar; the commands>
+Toolchain skills: <which of the skills in ~/.claude/skills to read for SwiftUI, App Intents, Instruments work; from CLAUDE.md's line>
 Anything else every builder here needs: <one line each>
