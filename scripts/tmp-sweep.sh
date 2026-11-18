@@ -87,12 +87,13 @@ done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -name 'ibtoold-[0-9]*' -pri
 # 3. SwiftPM lock files named after a scratch path (`_private_var_folders_..._SourcePackages_....lock`). SwiftPM only
 #    opens and flocks them, so every one is zero-length and its age is its creation; what tells a stale one from a
 #    live one is that no process holds it open, and even that has a window between the check and the removal. So the
-#    class is skipped altogether while a Swift or Xcode build tool runs on the machine (Xcode itself and sourcekit-lsp
-#    resolve packages too), lsof is asked once for all
-#    candidates (one call per file costs seconds each on macOS), and without lsof the files stay.
+#    class is skipped altogether while a Swift or Xcode build tool runs on the machine, lsof is asked once for all
+#    candidates (one call per file costs seconds each on macOS), and without lsof the files stay. Xcode itself and
+#    sourcekit-lsp are not on the gate's list: they run whenever Xcode is open, so with them the class never ran on
+#    such a machine (round 54, a shift's report); a lock one of them holds open is kept by the lsof check anyway.
 lk_all=0; lk_old=0; lk_gone=0; lk_note=""; lk_cands=()
 if ! command -v lsof >/dev/null 2>&1; then lk_note=" (lsof not found: lock files are left alone, since an open one cannot be told from a stale one)"
-elif pgrep -x 'swift-build|swift-package|swift-frontend|swift-test|swift|xcodebuild|Xcode|sourcekit-lsp' >/dev/null 2>&1; then
+elif pgrep -x 'swift-build|swift-package|swift-frontend|swift-test|swift|xcodebuild' >/dev/null 2>&1; then
   lk_note=" (a Swift or Xcode build tool is running: lock files are left alone this time)"
 fi
 while IFS= read -r -d '' f; do

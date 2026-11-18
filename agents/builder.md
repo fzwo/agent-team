@@ -23,7 +23,7 @@ The issue or task, the branch name, the worktree path, the files you are expecte
 
 ## What you report
 
-One report, when you are done: the hand-back is the channel, and a second report within one run has no reliable one (hand-backs were refused and messages lost in a shift of the first project). If something must be said before you are done, say it in the hand-back and let the session resume you. The branch and the PR, what you changed and why, the evidence for each verification item (what was observed, where), what you did not do, and anything you noticed outside the task. Under about 60 lines: the session carries every report for the whole shift. Measurements as a table (what, runs, min, median, max), never as pasted log excerpts; put logs in a file and name the path. Look at a screenshot only when the verification needs the image; the files are evidence for design, not reading for you.
+One report, when you are done, under about 20 lines (what was done, what was observed, the PR, what is open; the log of what you ran goes to a file in your worktree's scratch, path in the report): the hand-back is the channel, and a second report within one run has no reliable one (hand-backs were refused and messages lost in a shift of the first project). If something must be said before you are done, say it in the hand-back and let the session resume you. The branch and the PR, what you changed and why, the evidence for each verification item (what was observed, where), what you did not do, and anything you noticed outside the task. Measurements as a table (what, runs, min, median, max), never as pasted log excerpts. Look at a screenshot only when the verification needs the image; the files are evidence for design, not reading for you.
 
 ## Rules
 

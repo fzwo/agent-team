@@ -1091,6 +1091,11 @@ if run sweep; then echo "sweep"
   [ $rc = 0 ] && [ -f "$sw/_Users_me_x.lock" ] && printf '%s' "$out" | grep -q "a Swift or Xcode build tool is running: lock files are left alone" && ok "sweep: with a build tool running the lock files stay and the report says why" || bad "gate: rc=$rc $out / $(ls -A "$sw")"
   [ ! -d "$sw/TemporaryDirectory.aaaaaa" ] && ok "sweep: with a build tool running the folders are still swept" || bad "folders not swept under the gate"
   [ ! -e "$sw/instruments_old.ktrace" ] && ok "sweep: a build tool does not gate the trace bundles" || bad "ktrace gated by a build tool: $out"
+  # Xcode open but idle (Xcode and sourcekit-lsp running, no build tool): the lock class runs, since those two run whenever Xcode is open.
+  rm -rf "$sw"; mkdir -p "$sw" "$work/sweep/xcode"; plant
+  printf '#!/bin/bash\ncase "$*" in *Xcode*|*sourcekit*) exit 0 ;; *) exit 1 ;; esac\n' > "$work/sweep/xcode/pgrep"; chmod +x "$work/sweep/xcode/pgrep"
+  out=$(PATH="$work/sweep/xcode:$PATH" bash "$here/scripts/tmp-sweep.sh" --delete "$sw" 2>&1); rc=$?
+  if command -v lsof >/dev/null 2>&1; then [ $rc = 0 ] && [ ! -f "$sw/_Users_me_x.lock" ] && ! printf '%s' "$out" | grep -q "left alone this time" && ok "sweep: Xcode and sourcekit-lsp alone do not gate the lock files" || bad "Xcode gated the locks: rc=$rc $out"; fi
   rm -rf "$sw"; mkdir -p "$sw" "$work/sweep/trace"; plant
   printf '#!/bin/bash\ncase "$*" in *xctrace*) exit 0 ;; *) exit 1 ;; esac\n' > "$work/sweep/trace/pgrep"; chmod +x "$work/sweep/trace/pgrep"   # Instruments runs, no build tool
   out=$(PATH="$work/sweep/trace:$PATH" bash "$here/scripts/tmp-sweep.sh" --delete "$sw" 2>&1); rc=$?

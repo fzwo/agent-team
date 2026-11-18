@@ -27,7 +27,7 @@ For each finding: severity (`blocks merge` / `should fix` / `note`), file and li
 
 A clean round says what you checked, which inputs you tried and which tests you ran, so the next round can build on it. "Looks good" is not a report.
 
-Keep the report under about 60 lines. The session that reads it carries every report for the whole shift. Quote at most the lines that show a finding; refer to files and line numbers for the rest.
+Keep the report under about 30 lines: the verdict, each finding in two lines with file and line, what you checked in one paragraph. The evidence (commands, outputs, probe scripts) goes to a file in your scratch directory whose path the report names, so the session can send a builder to it without reading it. The session that reads it carries every report for the whole shift; a shift once hit its context limit on report volume, not on work. Quote at most the lines that show a finding; refer to files and line numbers for the rest.
 
 ## Rules
 
