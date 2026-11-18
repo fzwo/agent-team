@@ -127,7 +127,7 @@ fi
 # Locks from before 0.4.0 sat directly under ~/.agentlock; move them where 0.4.0 looks, so they show up and expire.
 for d in "$HOME/.agentlock"/*/; do
   n=$(basename "$d")
-  [ -d "$d" ] && [ -f "$d/info" ] && [ "$n" != locks ] || continue
+  [ -d "$d" ] && [ -f "$d/info" ] && [ "$n" != locks ] && [ "$n" != waits ] || continue   # locks/ and waits/ are 0.4's own, markers included
   mkdir -p "$HOME/.agentlock/locks"
   if [ -e "$HOME/.agentlock/locks/$n" ]; then
     echo "left pre-0.4.0 lock ~/.agentlock/$n in place: locks/$n already exists; remove the old one by hand once it is not needed" >&2

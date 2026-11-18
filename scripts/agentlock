@@ -33,6 +33,9 @@
 # sub-owner "<session>:<name>": sub-owners exclude each other, and the guard,
 # "quiet" and release-all treat a session and its sub-owners as one party.
 # A lock is stale when its holder's pid is gone or its TTL has passed.
+# A wait keeps its place: waiters hold tickets, the oldest live ticket gets the
+# lock next, a plain acquire while someone waits is refused (use --wait), and
+# `status` lists the waiters. A ticket whose waiter is gone is dropped.
 #
 # Two resources are special. "ui" is the convention for the screen and the
 # keyboard. "quiet" means a measurement needs the machine to itself: taking it
@@ -49,6 +52,7 @@ set -u
 
 LOCK_ROOT="${AGENTLOCK_DIR:-$HOME/.agentlock}"
 LOCKS="$LOCK_ROOT/locks"
+WAITS="$LOCK_ROOT/waits"   # one directory per resource, one ticket file per live waiter
 DEFAULT_TTL="${AGENTLOCK_DEFAULT_TTL:-30m}"
 POLL_SECONDS="${AGENTLOCK_POLL:-5}"
 WRITE_GRACE=5        # seconds a lock dir may exist without info before it is stale
@@ -170,6 +174,44 @@ poll_sleep() {
   [ "$p" = "$START_PPID" ] || die "the shell that started this wait is gone; giving up"
   sleep "$POLL_SECONDS"
 }
+# Wait tickets (round 52): a waiter registers one when it first finds the lock busy; the oldest live ticket is served
+# first, so a builder that waited an hour is not passed by a newcomer (a shift saw one wait three times 30 to 60
+# minutes while the lock passed between others). A plain acquire steps behind live waiters and is refused with
+# their count. A ticket is <since>.<pid> under waits/<resource>/; one whose pid is gone is dropped by whoever sees it.
+TICKET=""
+ticket_dir() { printf '%s/%s' "$WAITS" "$(basename "$1")"; }   # $1 = lock dir
+reap_tickets() {   # $1 = ticket dir: drop tickets whose waiter is gone, or whose wait is over (a reused pid would otherwise hold the line)
+  local t p e; for t in "$1"/*; do
+    [ -f "$t" ] || continue
+    case "${t##*/}" in *.tmp.*) [ $(( $(now) - $(mtime "$t") )) -gt $WRITE_GRACE ] && rm -f "$t"; continue ;; esac   # a writer killed between write and mv (the name, not the path)
+    p=$(info_get "$t" pid); e=$(info_get "$t" expires)
+    { [ -n "$p" ] && proc_alive "$p"; } || { rm -f "$t"; continue; }
+    if [ -n "$e" ] && [ "$e" != 0 ] && [ "$(now)" -gt "$e" ]; then rm -f "$t"; fi
+  done
+}
+live_tickets() { [ -d "$1" ] || return 0; reap_tickets "$1"; ls "$1" 2>/dev/null | grep -v '\.tmp\.' | sort; }   # oldest first; a half-written ticket is not one
+drop_ticket() { [ -n "$TICKET" ] && rm -f "$TICKET"; TICKET=""; }
+take_ticket() {   # $1 = ticket dir, $2 = reason, $3 = the wait's deadline (epoch; the ticket expires with it)
+  # Called on every waiting poll: a ticket that went missing (an old copy's clean, a reader between open and write in
+  # an older version) is written again under its own name, so the place in the line is kept. Written whole: tmp, then mv.
+  if [ -n "$TICKET" ] && [ -f "$TICKET" ]; then return 0; fi
+  mkdir -p "$1" 2>/dev/null || return 0
+  # The same marker locks/ carries: a pre-0.4.0 copy's clean would otherwise remove waits/ as a stale bare lock.
+  [ -e "$WAITS/info" ] || printf 'owner=agentlock-0.4.0-marker\nacquired=%s\nexpires=0\nreason=not-a-lock\n' "$(now)" > "$WAITS/info" 2>/dev/null || true
+  [ -n "$TICKET" ] || TICKET="$1/$(printf '%010d' "$(now)").$$"
+  local since; since="${TICKET##*/}"; since="${since%%.*}"   # the name's first part, so a rewritten ticket keeps its place
+  printf 'owner=%s\npid=%s\nsince=%s\nexpires=%s\nreason=%s\n' "$(owner_id)" "$$" "$since" "${3:-0}" "$(oneline "$2")" > "$TICKET.tmp.$$" 2>/dev/null \
+    && mv "$TICKET.tmp.$$" "$TICKET" 2>/dev/null || { rm -f "$TICKET.tmp.$$"; TICKET=""; return 0; }
+  trap 'drop_ticket' EXIT; trap 'drop_ticket; exit 143' TERM; trap 'drop_ticket; exit 130' INT; trap 'drop_ticket; exit 129' HUP
+}
+my_turn() {   # $1 = ticket dir: no live ticket older than mine
+  local first; first=$(live_tickets "$1" | head -1); [ -z "$first" ] || [ "$first" = "$(basename "$TICKET")" ]
+}
+describe_ticket() {   # $1 = ticket file
+  local s; s=$(info_get "$1" since); case "$s" in ''|*[!0-9]*) s=$(now) ;; *) s=$((10#$s)) ;; esac   # names are zero-padded: not octal
+  printf 'owner=%s pid=%s waiting=%ss reason=%s' "$(info_get "$1" owner)" "$(info_get "$1" pid)" "$(( $(now) - s ))" "$(info_get "$1" reason)"
+}
+
 # Extend a held lock's expiry by its original ttl: the guard does this on every guarded command, so a batch of
 # test runs keeps its lock as long as commands keep coming (a 60-minute ttl once ran out mid-batch and two
 # builders overlapped on one simulator).
@@ -240,7 +282,7 @@ others_live() {
   local d
   for d in "$LOCKS"/*/ "$LOCK_ROOT"/*/; do
     # A bare legacy directory counts here as it does for acquire: busy through the grace period, then ignored.
-    is_lock_dir "${d%/}" || { [ -d "$d" ] && [ "$(basename "$d")" != locks ] && [ ! -f "$d/info" ]; } || continue
+    is_lock_dir "${d%/}" || { [ -d "$d" ] && [ "$(basename "$d")" != locks ] && [ "$(basename "$d")" != waits ] && [ ! -f "$d/info" ]; } || continue
     held_by_me "${d%/}" && continue
     is_stale "${d%/}" && continue
     basename "$d"
@@ -254,12 +296,12 @@ others_live() {
 is_lock_dir() {  # a directory under locks/, or a legacy directory with an info file (paths may hold spaces: no lists)
   case "$1" in
     "$LOCKS"/*) [ -d "$1" ] ;;
-    *) [ -f "$1/info" ] && [ "$(basename "$1")" != locks ] ;;
+    *) [ -f "$1/info" ] && [ "$(basename "$1")" != locks ] && [ "$(basename "$1")" != waits ] ;;
   esac
 }
 # For a named resource any directory counts, info file or not: the old copy's mkdir comes before
 # its write, and is_stale's grace period covers that window as it does for the new layout.
-legacy_dir() { [ "$1" != locks ] && [ -d "$LOCK_ROOT/$1" ] && printf '%s' "$LOCK_ROOT/$1"; }
+legacy_dir() { [ "$1" != locks ] && [ "$1" != waits ] && [ -d "$LOCK_ROOT/$1" ] && printf '%s' "$LOCK_ROOT/$1"; }   # locks/ and waits/ are this layout's own
 
 cmd_acquire() {
   local res="" ttl="$DEFAULT_TTL" reason="" wait="" quiet=""
@@ -289,11 +331,26 @@ cmd_acquire() {
   # writes the same marker after migrating old locks; keep the two in step.)
   [ -e "$LOCKS/info" ] || printf 'owner=agentlock-0.4.0-marker\nacquired=%s\nexpires=0\nreason=not-a-lock\n' "$(now)" > "$LOCKS/info" 2>/dev/null || true
   if [ -e "$dir" ] && [ ! -d "$dir" ]; then die "$dir exists and is not a lock"; fi
+  local tdir nw; tdir=$(ticket_dir "$dir")
   while :; do
+    # Waiters ahead of us (quiet has its own order: it waits for everything). A lock we hold is ours whoever waits.
+    if [ "$res" != quiet ] && [ -d "$tdir" ] && ! { [ -d "$dir" ] && held_by_me "$dir"; }; then
+      if [ -n "$TICKET" ]; then
+        take_ticket "$tdir" "$reason" "$deadline"   # written again if it went missing
+        if ! my_turn "$tdir"; then if [ "$(now)" -lt "$deadline" ]; then poll_sleep; continue; fi; printf 'agentlock: %s is busy: %s other waiter(s) in line; gave up after the wait\n' "$res" "$(( $(live_tickets "$tdir" | grep -vc "^${TICKET##*/}\$") ))" >&2; return 1; fi
+      else
+        nw=$(live_tickets "$tdir" | wc -l | tr -d ' ')
+        if [ "$nw" -gt 0 ]; then
+          if [ "$deadline" -gt 0 ]; then take_ticket "$tdir" "$reason" "$deadline"; poll_sleep; continue; fi
+          printf 'agentlock: %s has %s waiter(s) ahead of you (first: %s); wait your turn with --wait, or do something else\n' "$res" "$nw" "$(describe_ticket "$tdir/$(live_tickets "$tdir" | head -1)")" >&2
+          return 1
+        fi
+      fi
+    fi
     # While another party holds "quiet", nothing else is handed out.
     local q; q=$(quiet_by_other)
     if [ -n "$q" ] && [ "$res" != quiet ]; then
-      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then poll_sleep; continue; fi
+      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then take_ticket "$tdir" "$reason" "$deadline"; poll_sleep; continue; fi   # the line is kept under a measurement too
       printf 'agentlock: machine is quiet for a measurement: %s\n' "$(describe "$q")" >&2
       return 1
     fi
@@ -308,7 +365,7 @@ cmd_acquire() {
     fi
     local lg; lg=$(legacy_dir "$res" || true)
     if [ -n "$lg" ] && ! held_by_my_session "$lg" && ! is_stale "$lg"; then
-      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then poll_sleep; continue; fi
+      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then [ "$res" = quiet ] || take_ticket "$tdir" "$reason" "$deadline"; poll_sleep; continue; fi
       printf 'agentlock: %s is busy, held through a pre-0.4.0 copy (that session has not restarted): %s\n' "$res" "$(describe "$lg")" >&2
       return 1
     fi
@@ -317,6 +374,7 @@ cmd_acquire() {
       lg=$(legacy_dir "$res" || true)
       if [ -n "$lg" ] && ! held_by_my_session "$lg" && ! is_stale "$lg"; then rmdir "$dir" 2>/dev/null; continue; fi
       if write_info "$dir" "$ttl_s" "$reason"; then
+        drop_ticket
         [ -z "$quiet" ] && echo "acquired $res ($(owner_id), ttl ${ttl_s}s)"
         return 0
       fi
@@ -352,6 +410,7 @@ cmd_acquire() {
       continue
     fi
     if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then
+      [ "$res" = quiet ] || take_ticket "$tdir" "$reason" "$deadline"   # from the first busy poll on, our place in the line is kept
       poll_sleep; continue
     fi
     printf 'agentlock: %s is busy: %s\n' "$res" "$(describe "$dir")" >&2
@@ -509,9 +568,13 @@ cmd_status() {
   if [ -n "${1:-}" ]; then
     d=$(res_dir "$1") || exit 1
     if [ ! -d "$d" ]; then d=$(legacy_dir "$1" || true); flag=" [pre-0.4.0 copy]"; else flag=""; fi
-    [ -n "$d" ] && [ -d "$d" ] || { echo "$1: free"; return 0; }
+    if ! { [ -n "$d" ] && [ -d "$d" ]; }; then
+      echo "$1: free"; local t td; td=$(ticket_dir "$(res_dir "$1")"); for t in $(live_tickets "$td"); do echo "  waiting on $1: $(describe_ticket "$td/$t")"; done; return 0
+    fi
     is_stale "$d" && flag="$flag [STALE]"
-    echo "$1: $(describe "$d")$flag"; return 0
+    echo "$1: $(describe "$d")$flag"
+    local t td; td=$(ticket_dir "$(res_dir "$1")"); for t in $(live_tickets "$td"); do echo "  waiting on $1: $(describe_ticket "$td/$t")"; done
+    return 0
   fi
   local any=""
   for d in "$LOCKS"/*/; do
@@ -526,6 +589,10 @@ cmd_status() {
     echo "$(basename "$d"): $(describe "${d%/}") [pre-0.4.0 copy]$flag"
   done
   [ -z "$any" ] && echo "no locks"
+  local t; for d in "$WAITS"/*/; do
+    [ -d "$d" ] || continue
+    for t in $(live_tickets "${d%/}"); do echo "  waiting on $(basename "$d"): $(describe_ticket "${d%/}/$t")"; done
+  done
   return 0
 }
 
@@ -536,6 +603,8 @@ cmd_clean() {
     is_lock_dir "${d%/}" || continue
     if is_stale "${d%/}"; then echo "removing stale $(basename "$d")"; remove_lock "${d%/}"; fi
   done
+  for d in "$WAITS"/*/; do [ -d "$d" ] || continue; reap_tickets "${d%/}"; done   # tickets of waiters gone or past their deadline
+  return 0
 }
 
 # Validate guard.conf: a tab between resource and regex, and a regex grep -E accepts.

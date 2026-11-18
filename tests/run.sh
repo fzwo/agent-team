@@ -43,6 +43,10 @@ if run lock; then echo "lock"
     AGENTLOCK_OWNER=A $L acquire ui --ttl 2m >/dev/null
     "$work/agentlock-0.3.15" clean >/dev/null 2>&1
     [ -f "$AGENTLOCK_DIR/locks/ui/info" ] && ok "0.3.15 clean leaves locks/ alone" || bad "0.3.15 clean deleted locks/"
+    mkdir -p "$AGENTLOCK_DIR/waits/ui"; printf 'owner=agentlock-0.4.0-marker\nacquired=1\nexpires=0\nreason=not-a-lock\n' > "$AGENTLOCK_DIR/waits/info"; printf 'owner=W\npid=%s\nsince=1\nexpires=0\nreason=r\n' "$$" > "$AGENTLOCK_DIR/waits/ui/0000000001.$$"
+    "$work/agentlock-0.3.15" clean >/dev/null 2>&1
+    [ -f "$AGENTLOCK_DIR/waits/ui/0000000001.$$" ] && ok "0.3.15 clean leaves waits/ alone, thanks to its marker" || bad "0.3.15 clean deleted waits/"
+    rm -rf "$AGENTLOCK_DIR/waits"
     AGENTLOCK_OWNER=A $L release ui >/dev/null
   else echo "  skip 0.3.15 clean (commit 4ab2d13 not in this clone)"; fi
   # A session started before the update still holds locks directly under the root; those must exclude this layout.
@@ -143,6 +147,96 @@ if run lock; then echo "lock"
   ( sleep 2; AGENTLOCK_OWNER=A $L release sim:p >/dev/null ) & PATH="$work/nops:$PATH" AGENTLOCK_POLL=1 AGENTLOCK_OWNER=B $L acquire sim:p --ttl 1m --wait 10s >/dev/null 2>&1; check "a failing ps does not end the wait: the lock is acquired once released" $? 0
   AGENTLOCK_OWNER=B $L release sim:p >/dev/null
   # The lock name carries this suite's pid: the pgrep below is machine-wide and once saw another suite's waiter (round 47).
+  # Wait tickets: the oldest live waiter is served first; a plain acquire steps behind live waiters; dead tickets are dropped.
+  AGENTLOCK_OWNER=A $L acquire q1 --ttl 1m >/dev/null
+  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W1 $L acquire q1 --ttl 1m --wait 40s --reason first >/dev/null 2>&1; echo $? > "$work/w1.rc" ) & wq1=$!
+  sleep 1.5
+  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W2 $L acquire q1 --ttl 1m --wait 40s --reason second >/dev/null 2>&1; echo $? > "$work/w2.rc" ) & wq2=$!
+  sleep 1.5
+  [ -f "$AGENTLOCK_DIR/waits/info" ] && grep -q '^expires=0$' "$AGENTLOCK_DIR/waits/info" && ok "the first ticket writes the waits/ marker a pre-0.4.0 clean respects" || bad "no waits/info marker after a wait"
+  st=$($L status); printf '%s\n' "$st" | grep -q "waiting on q1: owner=W1 .*reason=first" && printf '%s\n' "$st" | grep -q "waiting on q1: owner=W2 .*reason=second" && [ "$(printf '%s\n' "$st" | grep -c 'waiting on q1')" = 2 ] && ok "status lists the waiters with their reasons" || bad "waiters not listed: $st"
+  [ "$(printf '%s\n' "$st" | grep 'waiting on q1' | head -1 | grep -c 'owner=W1')" = 1 ] && ok "the first waiter is listed first" || bad "order: $st"
+  AGENTLOCK_OWNER=B $L acquire q1 --ttl 1m >/dev/null 2>&1; check "a plain acquire while waiters are in line is refused" $? 1
+  AGENTLOCK_OWNER=B $L acquire q1 --ttl 1m 2>&1 >/dev/null | grep -q "has 2 waiter(s) ahead of you (first: owner=W1" && ok "the refusal names the count and the first waiter" || bad "refusal text: $(AGENTLOCK_OWNER=B $L acquire q1 --ttl 1m 2>&1)"
+  $L status q1 | grep -q "waiting on q1: owner=W1" && ok "status <resource> lists that resource's waiters" || bad "status q1: $($L status q1)"
+  t1=$(ls "$AGENTLOCK_DIR/waits/q1" | head -1); rm -f "$AGENTLOCK_DIR/waits/q1/$t1"; sleep 2.5
+  [ -f "$AGENTLOCK_DIR/waits/q1/$t1" ] && ok "a ticket removed under a waiter is written again under its own name on the next poll" || bad "ticket not rewritten: $(ls "$AGENTLOCK_DIR/waits/q1")"
+  AGENTLOCK_OWNER=A $L release q1 >/dev/null; sleep 3
+  [ "$(cat "$work/w1.rc" 2>/dev/null)" = 0 ] && [ ! -f "$work/w2.rc" ] && $L status | grep -q "^q1: owner=W1 " && ok "the first waiter gets the lock when it frees; the second keeps waiting" || bad "handover: w1=$(cat "$work/w1.rc" 2>/dev/null) w2=$(cat "$work/w2.rc" 2>/dev/null) $($L status)"
+  $L status | grep -q "waiting on q1: owner=W2" && ! $L status | grep -q "waiting on q1: owner=W1" && ok "the served waiter's ticket is gone, the other's stays" || bad "tickets after handover: $($L status)"
+  AGENTLOCK_OWNER=W1 $L release q1 >/dev/null; sleep 3
+  [ "$(cat "$work/w2.rc" 2>/dev/null)" = 0 ] && $L status | grep -q "^q1: owner=W2 " && ! $L status | grep -q "waiting on q1" && ok "the second waiter gets it next, and no ticket remains" || bad "second handover: w2=$(cat "$work/w2.rc" 2>/dev/null) $($L status)"
+  wait $wq1 $wq2 2>/dev/null; AGENTLOCK_OWNER=W2 $L release q1 >/dev/null
+  # A dead ticket (its waiter gone) is dropped by the next party that looks, and does not block a plain acquire.
+  mkdir -p "$AGENTLOCK_DIR/waits/q1"; printf 'owner=ghost\npid=4194300\nsince=1\nreason=gone\n' > "$AGENTLOCK_DIR/waits/q1/0000000001.4194300"
+  AGENTLOCK_OWNER=B $L acquire q1 --ttl 1m >/dev/null 2>&1; check "a dead waiter's ticket does not block a plain acquire" $? 0
+  [ ! -e "$AGENTLOCK_DIR/waits/q1/0000000001.4194300" ] && ok "the dead ticket is dropped" || bad "dead ticket kept"
+  AGENTLOCK_OWNER=B $L release q1 >/dev/null
+  # A live ticket with the lock free: a plain acquire is refused (the behaviour that is new), a ticket past its deadline is not a ticket.
+  printf 'owner=L\npid=%s\nsince=%s\nexpires=%s\nreason=live\n' "$$" "$(date +%s)" "$(( $(date +%s) + 600 ))" > "$AGENTLOCK_DIR/waits/q1/$(date +%s).$$"
+  AGENTLOCK_OWNER=B $L acquire q1 --ttl 1m >/dev/null 2>&1; check "a live ticket refuses a plain acquire even when the lock is free" $? 1
+  rm -f "$AGENTLOCK_DIR/waits/q1/"*; printf 'owner=L\npid=%s\nsince=1\nexpires=2\nreason=over\n' "$$" > "$AGENTLOCK_DIR/waits/q1/0000000001.$$"
+  AGENTLOCK_OWNER=B $L acquire q1 --ttl 1m >/dev/null 2>&1; check "a ticket past its deadline does not block, whatever its pid" $? 0
+  [ -z "$(ls "$AGENTLOCK_DIR/waits/q1")" ] && ok "the expired ticket is dropped" || bad "expired ticket kept"
+  AGENTLOCK_OWNER=B $L release q1 >/dev/null
+  printf 'owner=L\npid=%s\nsince=1\nexpires=2\nreason=over\n' "$$" > "$AGENTLOCK_DIR/waits/q1/0000000001.$$"; $L clean >/dev/null; [ -z "$(ls "$AGENTLOCK_DIR/waits/q1")" ] && ok "clean reaps tickets too" || bad "clean left a ticket"
+  # waits/ created this very second with nothing held: a quiet must not see it as a bare pre-0.4.0 lock (five seconds of grace would hide the bug).
+  rm -rf "$AGENTLOCK_DIR/waits"; mkdir -p "$AGENTLOCK_DIR/waits/x"; AGENTLOCK_OWNER=Q $L acquire quiet --ttl 1m >/dev/null 2>&1; check "a fresh waits/ is not a lock to quiet's check" $? 0; AGENTLOCK_OWNER=Q $L release quiet >/dev/null
+  # A half-written ticket left behind (writer killed between write and mv) is not a ticket and is reaped once old.
+  mkdir -p "$AGENTLOCK_DIR/waits/q1"; printf 'owner=K\npid=4194300\nsince=1\nexpires=2\nreason=k\n' > "$AGENTLOCK_DIR/waits/q1/0000000001.4194300.tmp.4194300"; touch -t 202001010000 "$AGENTLOCK_DIR/waits/q1/0000000001.4194300.tmp.4194300"
+  AGENTLOCK_OWNER=B $L acquire q1 --ttl 1m >/dev/null 2>&1; check "a leftover half-written ticket does not block a plain acquire" $? 0
+  [ -z "$(ls "$AGENTLOCK_DIR/waits/q1")" ] && ok "the old half-written ticket is reaped" || bad "tmp ticket kept: $(ls "$AGENTLOCK_DIR/waits/q1")"
+  AGENTLOCK_OWNER=B $L release q1 >/dev/null
+  # A young half-written ticket (a rewrite in progress: live pid, future deadline, within the grace) is not a ticket either, and is left for its writer.
+  printf 'owner=K\npid=%s\nsince=%s\nexpires=%s\nreason=k\n' "$$" "$(date +%s)" "$(( $(date +%s) + 600 ))" > "$AGENTLOCK_DIR/waits/q1/$(date +%s).$$.tmp.$$"
+  AGENTLOCK_OWNER=B $L acquire q1 --ttl 1m >/dev/null 2>&1; check "a half-written ticket in progress does not count as a waiter" $? 0
+  [ -n "$(ls "$AGENTLOCK_DIR/waits/q1")" ] && ok "a young half-written ticket is left for its writer" || bad "young tmp ticket removed"
+  rm -f "$AGENTLOCK_DIR/waits/q1/"*; AGENTLOCK_OWNER=B $L release q1 >/dev/null
+  # The headline property, deterministically: an older live ticket on a free resource makes a waiter defer until it is gone.
+  printf 'owner=O\npid=%s\nsince=1\nexpires=%s\nreason=older\n' "$$" "$(( $(date +%s) + 600 ))" > "$AGENTLOCK_DIR/waits/q1/0000000001.$$"
+  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W4 $L acquire q1 --ttl 1m --wait 30s >/dev/null 2>&1; echo $? > "$work/w4.rc" ) & wq4=$!
+  sleep 2.5; [ ! -d "$AGENTLOCK_DIR/locks/q1" ] && [ "$(ls "$AGENTLOCK_DIR/waits/q1" | wc -l | tr -d ' ')" = 2 ] && ok "a waiter defers to an older live ticket on a free resource, holding its own" || bad "deferral: lock=$(ls -d "$AGENTLOCK_DIR/locks/q1" 2>/dev/null) tickets=$(ls "$AGENTLOCK_DIR/waits/q1")"
+  rm -f "$AGENTLOCK_DIR/waits/q1/0000000001.$$"; sleep 2.5
+  [ "$(cat "$work/w4.rc" 2>/dev/null)" = 0 ] && $L status q1 | grep -q "^q1: owner=W4 " && ok "the waiter takes the lock once the older ticket is gone" || bad "after older ticket gone: $(cat "$work/w4.rc" 2>/dev/null) $($L status q1)"
+  wait $wq4 2>/dev/null; AGENTLOCK_OWNER=W4 $L release q1 >/dev/null
+  # with --wait behind a holder: once it has the lock, its ticket is gone while the command runs.
+  AGENTLOCK_OWNER=A $L acquire q1 --ttl 1m >/dev/null
+  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W5 $L with q1 --ttl 1m --wait 30s -- sleep 6 >/dev/null 2>&1 ) & wq5=$!
+  sleep 1.5; AGENTLOCK_OWNER=A $L release q1 >/dev/null; sleep 2.5
+  $L status q1 | grep -q "^q1: owner=W5 " && ! $L status q1 | grep -q "waiting on q1" && ok "with --wait drops its ticket when it takes the lock, while its command runs" || bad "with ticket: $($L status q1)"
+  wait $wq5 2>/dev/null
+  # A waiter blocked by someone else's quiet takes its ticket too: after the measurement, a newcomer's plain acquire is refused.
+  AGENTLOCK_OWNER=Q $L acquire quiet --ttl 1m >/dev/null
+  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W6 $L acquire q1 --ttl 1m --wait 30s >/dev/null 2>&1; echo $? > "$work/w6.rc" ) & wq6=$!
+  sleep 2.5; [ -n "$(ls "$AGENTLOCK_DIR/waits/q1" 2>/dev/null)" ] && ok "a waiter blocked by a quiet holds a ticket" || bad "no ticket under quiet"
+  AGENTLOCK_OWNER=Q $L release quiet >/dev/null; AGENTLOCK_OWNER=N $L acquire q1 --ttl 1m >/dev/null 2>&1; check "after the measurement a newcomer's plain acquire is refused, the waiter is first" $? 1
+  sleep 2.5; [ "$(cat "$work/w6.rc" 2>/dev/null)" = 0 ] && ok "the waiter that waited through the quiet gets the lock" || bad "w6: $(cat "$work/w6.rc" 2>/dev/null) $($L status)"
+  wait $wq6 2>/dev/null; AGENTLOCK_OWNER=W6 $L release q1 >/dev/null
+  $L clean >/dev/null; check "clean exits 0 with waits/ present" $? 0
+  rm -rf "$AGENTLOCK_DIR/waits"; $L clean >/dev/null; check "clean exits 0 without waits/" $? 0
+  mkdir -p "$AGENTLOCK_DIR/waits"; printf 'owner=agentlock-0.4.0-marker\nacquired=1\nexpires=0\nreason=not-a-lock\n' > "$AGENTLOCK_DIR/waits/info"   # the marker present, as after any wait
+  AGENTLOCK_OWNER=A $L acquire waits --ttl 1m >/dev/null 2>&1; check "a resource named waits is an ordinary lock, marker present" $? 0; AGENTLOCK_OWNER=A $L release waits >/dev/null
+  # The holder's own re-acquire with a live ticket in line; a waiter behind a pre-0.4.0 lock holds a ticket whose expiry is its deadline.
+  AGENTLOCK_OWNER=A $L acquire q1 --ttl 1m >/dev/null; mkdir -p "$AGENTLOCK_DIR/waits/q1"; printf 'owner=O\npid=%s\nsince=1\nexpires=%s\nreason=older\n' "$$" "$(( $(date +%s) + 600 ))" > "$AGENTLOCK_DIR/waits/q1/0000000001.$$"
+  AGENTLOCK_OWNER=A $L acquire q1 --ttl 1m 2>&1 | grep -q "already held q1" && ok "the holder's re-acquire ignores a live ticket in line" || bad "holder refused by the line: $(AGENTLOCK_OWNER=A $L acquire q1 --ttl 1m 2>&1)"
+  rm -f "$AGENTLOCK_DIR/waits/q1/"*; AGENTLOCK_OWNER=A $L release q1 >/dev/null
+  mkdir -p "$AGENTLOCK_DIR/lg1"; printf 'owner=old\npid=%s\nacquired=%s\nexpires=%s\nreason=legacy\n' "$$" "$(date +%s)" "$(( $(date +%s) + 600 ))" > "$AGENTLOCK_DIR/lg1/info"   # a pre-0.4.0 lock held by a live pid
+  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W7 exec $L acquire lg1 --ttl 1m --wait 20s >/dev/null 2>&1 ) & wq7=$!   # exec: the kill below reaches the tool itself
+  sleep 2.5; t7=$(ls "$AGENTLOCK_DIR/waits/lg1" 2>/dev/null | head -1)
+  [ -n "$t7" ] && ok "a waiter behind a pre-0.4.0 lock holds a ticket" || bad "no ticket behind a legacy lock"
+  e7=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/waits/lg1/$t7" 2>/dev/null); nowq=$(date +%s)
+  [ -n "$e7" ] && [ "$e7" -gt $(( nowq + 10 )) ] && [ "$e7" -le $(( nowq + 20 )) ] && ok "a waiter's own ticket expires with its wait" || bad "ticket expiry: $e7 vs now $nowq"
+  kill -TERM $wq7 2>/dev/null; wait $wq7 2>/dev/null; sleep 1; rm -rf "$AGENTLOCK_DIR/lg1" "$AGENTLOCK_DIR/waits/lg1"
+  mkdir -p "$AGENTLOCK_DIR/waits/x.tmp.y"; printf 'owner=O\npid=%s\nsince=1\nexpires=%s\nreason=r\n' "$$" "$(( $(date +%s) + 600 ))" > "$AGENTLOCK_DIR/waits/x.tmp.y/0000000001.$$"; touch -t 202001010000 "$AGENTLOCK_DIR/waits/x.tmp.y/0000000001.$$"
+  AGENTLOCK_OWNER=B $L acquire x.tmp.y --ttl 1m >/dev/null 2>&1; check "a resource whose name holds .tmp. keeps its tickets: the plain acquire is refused" $? 1; rm -rf "$AGENTLOCK_DIR/waits/x.tmp.y"
+  # A waiter whose shell is killed leaves no ticket: its own trap, or the next party's reaping.
+  AGENTLOCK_OWNER=A $L acquire q1 --ttl 1m >/dev/null
+  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W3 exec $L acquire q1 --ttl 1m --wait 40s >/dev/null 2>&1 ) & wq3=$!
+  sleep 1.5; [ -n "$(ls "$AGENTLOCK_DIR/waits/q1" 2>/dev/null)" ] && ok "a waiting acquire holds a ticket" || bad "no ticket while waiting"
+  kill -TERM $wq3 2>/dev/null; wait $wq3 2>/dev/null; sleep 1
+  [ -z "$(ls "$AGENTLOCK_DIR/waits/q1" 2>/dev/null)" ] && ok "a killed waiter's ticket is gone" || bad "ticket left by a killed waiter: $(ls "$AGENTLOCK_DIR/waits/q1")"
+  AGENTLOCK_OWNER=A $L acquire q1 --ttl 1m >/dev/null 2>&1; check "the holder's own re-acquire ignores the line" $? 0
+  AGENTLOCK_OWNER=A $L release q1 >/dev/null
   # A re-acquire of an own lock refreshes but never shortens: with 1 h left, --ttl 1m leaves the expiry; --ttl 2h moves it out.
   AGENTLOCK_OWNER=A $L acquire ra --ttl 1h >/dev/null; e1=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
   out=$(AGENTLOCK_OWNER=A $L acquire ra --ttl 1m); rc=$?; e2=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
@@ -690,6 +784,7 @@ if run install; then echo "install"
   [ -d "$im/home/.agentlock/noinfo" ] && [ ! -e "$im/home/.agentlock/locks/noinfo" ] && ok "a bare directory is not migrated" || bad "bare directory migrated"
   grep -q '^expires=0$' "$im/home/.agentlock/locks/info" 2>/dev/null && ok "migration leaves the marker that protects locks/ from a pre-0.4.0 clean" || bad "no marker after migration"
   mkdir -p "$im/home/bin"; ln -sfn "$here/scripts/agentlock" "$im/home/bin/agentlock"   # the pre-wrapper link an older install left
+  mkdir -p "$im/home/.agentlock/waits/q1"; printf 'owner=agentlock-0.4.0-marker\nacquired=1\nexpires=0\nreason=not-a-lock\n' > "$im/home/.agentlock/waits/info"; printf 'owner=W\npid=%s\nsince=1\nexpires=0\nreason=r\n' "$$" > "$im/home/.agentlock/waits/q1/0000000001.$$"   # 0.4.29's wait tickets, with their marker: not a pre-0.4.0 lock
   # The kept guard.conf: one rule edited, one removed, one of the owner's own added; the installer names the first two.
   python3 - "$im/home/.agentlock/guard.conf" <<'PYX'
 import sys; p=sys.argv[1]; out=[]
@@ -702,6 +797,7 @@ PYX
   out=$(HOME="$im/home" PATH="$im/bin:$PATH" bash "$here/scripts/install-mac.sh" --bin-dir "$im/link" 2>&1); check "second run: exit 0" $? 0
   [ "$(readlink "$im/home/bin/agentlock")" = "$im/home/.agentlock/agentlock" ] && printf '%s' "$out" | grep -q "repointed the older link" && ok "an older ~/bin link is repointed at the wrapper" || bad "older ~/bin link left: $(readlink "$im/home/bin/agentlock")"
   printf '%s' "$out" | grep -q "kept existing" && printf '%s' "$out" | grep -q "stub-agentlock 0.10.0 check-conf" && ok "a kept guard.conf is checked with check-conf" || bad "kept guard.conf not checked: $out"
+  [ -f "$im/home/.agentlock/waits/q1/0000000001.$$" ] && [ ! -e "$im/home/.agentlock/locks/waits" ] && ! printf '%s' "$out" | grep -q "pre-0.4.0 lock waits" && ok "the installer leaves waits/ and its tickets where they are" || bad "waits/ migrated: $(ls "$im/home/.agentlock/locks" 2>/dev/null) $(printf '%s' "$out" | grep waits)"
   printf '%s' "$out" | grep -q "kept existing ~/.agentlock/guard.conf; against this version's example it differs in: sim; lacks: device; compare with" && ok "a kept guard.conf is compared with the example rule by rule: the edited and the missing rule are named, the owner's own is not" || bad "kept conf comparison: $(printf '%s' "$out" | grep 'kept existing')"
   cp "$here/hooks/guard.conf.example" "$im/home/.agentlock/guard.conf"
   out=$(HOME="$im/home" PATH="$im/bin:$PATH" bash "$here/scripts/install-mac.sh" --bin-dir "$im/link" 2>&1); printf '%s' "$out" | grep -q "every rule of this version's example is in it unchanged" && ok "a kept guard.conf equal to the example is reported as such" || bad "equal conf: $(printf '%s' "$out" | grep 'kept existing')"
@@ -1090,7 +1186,7 @@ GH
   reset_stub; : > "$mg/stub/merge-fails"; out=$(pm 7 2>&1); rc=$?
   [ $rc = 1 ] && printf '%s' "$out" | grep -q "gh pr merge refused #7; nothing was merged. Do not close the issue" && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: a refused gh pr merge exits 1 and says not to close the issue" || bad "merge refused: rc=$rc $out"
   pm x >/dev/null 2>&1; check "merge: a non-numeric PR is a usage error, exit 2" $? 2
-  pm 7 8 2>&1 >/dev/null | grep -q "one PR number, not two (7 and 8)" && ok "merge: two PR numbers are a usage error that names both" || bad "two numbers: $(pm 7 8 2>&1)"
+  out=$(pm 7 8 2>&1); rc=$?; [ $rc = 2 ] && printf '%s' "$out" | grep -q "one PR number, not two (7 and 8)" && ok "merge: two PR numbers are a usage error, exit 2, that names both" || bad "two numbers: rc=$rc $out"
   pm --dry-run >/dev/null 2>&1; check "merge: no PR number is a usage error, exit 2" $? 2
   reset_stub; out=$(pm --dry-run 7 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "dry run: #7" && ok "merge: the options may come before the PR number" || bad "options first: rc=$rc $out"
   pm 7 --bogus >/dev/null 2>&1; check "merge: an unknown option is a usage error, exit 2" $? 2
