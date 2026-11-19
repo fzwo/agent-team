@@ -989,7 +989,8 @@ STMTS
       echo "Take it first, e.g.: agentlock acquire ${missing## } --ttl 30m --reason \"<what you are doing>\""
       echo "If it is busy, wait with --wait 15m or do something else. Release it when done."
       case "$cmd" in *\|*) echo "(If this line used 'agentlock with ... -- <command> | ...', the pipe is what tripped the guard: run the command without the pipe, or take the lock first.)" ;; esac
-      echo "(agentlock acquire <resource> ... && <command> on one line also works: the && means the command runs only once the lock is held. Parentheses and braces are not tracked: 'acquire X && (a; b)' grants X to a only; take the lock in its own call before such a group.)"
+      echo "(agentlock acquire <resource> ... && <command> on one line also works: the && means the command runs only once the lock is held.)"
+      case "$cmd" in *\(*|*\{*) echo "(Parentheses and braces are not tracked: 'acquire X && (a; b)' grants X to a only; take the lock in its own call before such a group.)" ;; esac
       echo "Current holders:"; cmd_status
     } >&2
     exit 2

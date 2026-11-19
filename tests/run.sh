@@ -3,6 +3,9 @@
 # needs no GitHub (gh is stubbed) and touches nothing outside a scratch directory.
 #   tests/run.sh            run everything
 #   tests/run.sh lock       one group: lock | guard | watcher | cleanup | changelog | install | shift | sweep | publish | merge
+# Run it from a Claude Code session (or under any process named claude or node): the lock group's checks without
+# AGENTLOCK_OWNER take the tool's own identity, the nearest such ancestor, and without one the fallback is each
+# call's parent shell, so four checks fail (a detached mutant runner in round 57).
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 # The caller's environment must not leak into the scripts under test.
@@ -406,6 +409,8 @@ if run guard; then echo "guard"
   check "acquire && command needs no lock held yet" "$(g Z '"agentlock acquire device:00008130 --ttl 30m --reason install && xcrun devicectl device install app --device 00008130 x.app"')" 0
   check "acquire ; command is not a grant" "$(gm Z '"agentlock acquire device:00008130 --ttl 30m; xcrun devicectl device install app --device 00008130 x.app"')" "device"
   printf '%s' "{\"session_id\":\"Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"agentlock acquire device:00008130 --ttl 30m && (echo start; xcrun devicectl device install app --device 00008130 x.app)\"}}" | $L guard 2>&1 >/dev/null | grep -q "Parentheses and braces are not tracked" && ok "the block message says that parentheses and braces are not tracked" || bad "no parentheses hint in the block message"
+  printf '%s' "{\"session_id\":\"Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"agentlock acquire device:00008130 --ttl 30m && { echo start; xcrun devicectl device install app --device 00008130 x.app; }\"}}" | $L guard 2>&1 >/dev/null | grep -q "Parentheses and braces are not tracked" && ok "a brace group gets the hint too" || bad "no hint for a brace group"
+  out=$(printf '%s' "{\"session_id\":\"Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"xcrun devicectl device install app --device 00008130 x.app\"}}" | $L guard 2>&1 >/dev/null); printf '%s' "$out" | grep -q "needs a lock on: device" && ! printf '%s' "$out" | grep -q "Parentheses" && ok "a block without a group does not get the parentheses hint (0.4.35)" || bad "parentheses hint on a plain block: $out"
   check "acquire of another resource && command still needs the right lock" "$(gm Z '"agentlock acquire sim:x --ttl 30m && xcrun devicectl device install app --device 1 x.app"')" "device"
   check "a command substitution inside an echo still runs a tool" "$(gm Z '"echo $(xcrun simctl boot X)"')" "sim"
   check "a backtick substitution inside a head still runs a tool" "$(gm Z '"head -1 `xcrun devicectl device install app --device 1 x.app`"')" "device"
