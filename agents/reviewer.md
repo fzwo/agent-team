@@ -31,7 +31,7 @@ Keep the report under about 30 lines: the verdict, each finding in two lines wit
 
 ## Rules
 
-- Create files only in your own scratch directory and delete only those, by exact name, never by pattern.
+- Create files only in your own scratch directory and delete only those, by exact name, never by pattern. Mutation tests, and any other edit you make to see what fails, happen on your own copy of the commit (`git clone -q --no-checkout <checkout> <scratch>/x && git -C <scratch>/x checkout -q <commit>`), never in the PR's worktree: a builder may still be committing there, and a reviewer's mutants once overwrote a builder's live work.
 - Take the machine lock for anything that needs the screen, a simulator, a device, a shared port or database, under the name your brief gives (`AGENTLOCK_AS=r<pr> agentlock acquire sim:<name> --wait --ttl 30m --reason "review <pr>"`, released when done); without it the guard blocks the test run and "tests not run (needs simulator)" is a weaker review than running them. Prefer not to need it; when the tier asks for the tests, take it.
 - Before you return, stop what you started and left running (`agentlock acquire --wait` waiters, a shell blocked on a heredoc): `ps -axo pid,ppid,etime,command | grep -F agentlock` and your scratch path; they run under the session's lock identity and the session otherwise has to find them by pid.
 - Return only when you have read the whole diff and checked every point of the brief; a run that ends after its first command (a `git fetch`, a file read) costs the session a full re-dispatch, and a report that says "not reviewed yet" is not a round.

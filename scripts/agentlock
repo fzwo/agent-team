@@ -13,7 +13,7 @@
 #                                                                                 started it is gone or was never there: `( … --wait & )`;
 #                                                                                 on a lock you hold it refreshes the ttl and never shortens it)
 #   agentlock renew <resource> [--ttl 30m]       push a held lock's expiry out by its own ttl, or by --ttl (the guard does the former on every guarded command)
-#   agentlock free <resource>                    exit 0 when nobody else holds it, 1 when someone does (`status` is a report and exits 0 either way)
+#   agentlock free <resource>                    exit 0 when an acquire would get it now (nobody else holds it, no quiet by another party), else 1
 #   agentlock release <resource> [--force]
 #   agentlock release-all                 # everything this owner holds (a session: its builders' too)
 #   agentlock with <resource> [opts] -- <command...>   # acquire, run, release
@@ -331,7 +331,8 @@ cmd_acquire() {
   # writes the same marker after migrating old locks; keep the two in step.)
   [ -e "$LOCKS/info" ] || printf 'owner=agentlock-0.4.0-marker\nacquired=%s\nexpires=0\nreason=not-a-lock\n' "$(now)" > "$LOCKS/info" 2>/dev/null || true
   if [ -e "$dir" ] && [ ! -d "$dir" ]; then die "$dir exists and is not a lock"; fi
-  local tdir nw; tdir=$(ticket_dir "$dir")
+  local tdir nw told=""; tdir=$(ticket_dir "$dir")
+  waiting() { [ -n "$told" ] || { printf 'agentlock: waiting for %s: %s\n' "$res" "$1" >&2; told=1; }; }   # once per acquire, --quiet or not: a silent wait was the complaint
   while :; do
     # Waiters ahead of us (quiet has its own order: it waits for everything). A lock we hold is ours whoever waits.
     if [ "$res" != quiet ] && [ -d "$tdir" ] && ! { [ -d "$dir" ] && held_by_me "$dir"; }; then
@@ -341,7 +342,7 @@ cmd_acquire() {
       else
         nw=$(live_tickets "$tdir" | wc -l | tr -d ' ')
         if [ "$nw" -gt 0 ]; then
-          if [ "$deadline" -gt 0 ]; then take_ticket "$tdir" "$reason" "$deadline"; poll_sleep; continue; fi
+          if [ "$deadline" -gt 0 ]; then take_ticket "$tdir" "$reason" "$deadline"; waiting "$nw waiter(s) ahead in line"; poll_sleep; continue; fi
           printf 'agentlock: %s has %s waiter(s) ahead of you (first: %s); wait your turn with --wait, or do something else\n' "$res" "$nw" "$(describe_ticket "$tdir/$(live_tickets "$tdir" | head -1)")" >&2
           return 1
         fi
@@ -350,7 +351,7 @@ cmd_acquire() {
     # While another party holds "quiet", nothing else is handed out.
     local q; q=$(quiet_by_other)
     if [ -n "$q" ] && [ "$res" != quiet ]; then
-      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then take_ticket "$tdir" "$reason" "$deadline"; poll_sleep; continue; fi   # the line is kept under a measurement too
+      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then take_ticket "$tdir" "$reason" "$deadline"; waiting "machine is quiet for a measurement: $(describe "$q")"; poll_sleep; continue; fi   # the line is kept under a measurement too
       printf 'agentlock: machine is quiet for a measurement: %s\n' "$(describe "$q")" >&2
       return 1
     fi
@@ -358,14 +359,14 @@ cmd_acquire() {
     if [ "$res" = quiet ]; then
       local busy; busy=$(others_live | tr '\n' ' ')
       if [ -n "$busy" ]; then
-        if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then poll_sleep; continue; fi
+        if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then waiting "others hold: ${busy% }"; poll_sleep; continue; fi
         printf 'agentlock: cannot take quiet, others hold: %s\n' "$busy" >&2
         return 1
       fi
     fi
     local lg; lg=$(legacy_dir "$res" || true)
     if [ -n "$lg" ] && ! held_by_my_session "$lg" && ! is_stale "$lg"; then
-      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then [ "$res" = quiet ] || take_ticket "$tdir" "$reason" "$deadline"; poll_sleep; continue; fi
+      if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then [ "$res" = quiet ] || take_ticket "$tdir" "$reason" "$deadline"; waiting "held through a pre-0.4.0 copy: $(describe "$lg")"; poll_sleep; continue; fi
       printf 'agentlock: %s is busy, held through a pre-0.4.0 copy (that session has not restarted): %s\n' "$res" "$(describe "$lg")" >&2
       return 1
     fi
@@ -411,6 +412,7 @@ cmd_acquire() {
     fi
     if [ "$deadline" -gt 0 ] && [ "$(now)" -lt "$deadline" ]; then
       [ "$res" = quiet ] || take_ticket "$tdir" "$reason" "$deadline"   # from the first busy poll on, our place in the line is kept
+      waiting "held: $(describe "$dir")"
       poll_sleep; continue
     fi
     printf 'agentlock: %s is busy: %s\n' "$res" "$(describe "$dir")" >&2
@@ -520,10 +522,11 @@ cmd_wait() {
   [ -n "${1:-}" ] || die "usage: agentlock wait <resource> [timeout]"
   local dir deadline=0; dir=$(res_dir "$1") || exit 1
   if [ -n "${2:-}" ]; then local ws; ws=$(to_seconds "$2") || exit 1; [ "$ws" -gt 0 ] || exit 1; deadline=$(( $(now) + ws )); fi
-  local lg holder
+  local lg holder q
   while :; do
-    lg=$(legacy_dir "$1" || true)
-    if [ -d "$dir" ] && ! is_stale "$dir" && ! held_by_me "$dir"; then holder="$dir"
+    lg=$(legacy_dir "$1" || true); q=$(quiet_by_other)
+    if [ -n "$q" ] && [ "$1" != quiet ]; then holder="$q"   # a measurement holds the machine: the resource is not to be had yet
+    elif [ -d "$dir" ] && ! is_stale "$dir" && ! held_by_me "$dir"; then holder="$dir"
     elif [ -n "$lg" ] && ! is_stale "$lg" && ! held_by_my_session "$lg"; then holder="$lg"
     else break; fi
     if [ "$deadline" -gt 0 ] && [ "$(now)" -ge "$deadline" ]; then echo "still held: $(describe "$holder")" >&2; return 1; fi
@@ -537,9 +540,10 @@ cmd_check() {
   local dir; dir=$(res_dir "$1") || return 1
   [ -d "$dir" ] && held_by_me "$dir" && ! is_stale "$dir"
 }
-cmd_free() {   # exit 0 when nobody else holds <resource> live (free, stale, or mine); 1 when someone else does. `status` is a report and exits 0 either way.
+cmd_free() {   # exit 0 when an acquire would get <resource> now (free, stale, or mine, and no quiet held by another party); 1 otherwise. `status` is a report and exits 0 either way.
   [ -n "${1:-}" ] || die "usage: agentlock free <resource>"
-  local dir lg; dir=$(res_dir "$1") || return 1
+  local dir lg q; dir=$(res_dir "$1") || return 1
+  q=$(quiet_by_other); if [ -n "$q" ] && [ "$1" != quiet ]; then return 1; fi   # under someone else's quiet nothing is free to take (a shift saw "free" and then a refusal)
   if [ -d "$dir" ] && ! is_stale "$dir" && ! held_by_me "$dir"; then return 1; fi
   lg=$(legacy_dir "$1" || true)
   if [ -n "$lg" ] && ! is_stale "$lg" && ! held_by_my_session "$lg"; then return 1; fi
@@ -569,7 +573,9 @@ cmd_status() {
     d=$(res_dir "$1") || exit 1
     if [ ! -d "$d" ]; then d=$(legacy_dir "$1" || true); flag=" [pre-0.4.0 copy]"; else flag=""; fi
     if ! { [ -n "$d" ] && [ -d "$d" ]; }; then
-      echo "$1: free"; local t td; td=$(ticket_dir "$(res_dir "$1")"); for t in $(live_tickets "$td"); do echo "  waiting on $1: $(describe_ticket "$td/$t")"; done; return 0
+      local qo; qo=$(quiet_by_other)
+      if [ -n "$qo" ] && [ "$1" != quiet ]; then echo "$1: free, but the machine is quiet for a measurement: $(describe "$qo")"; else echo "$1: free"; fi
+      local t td; td=$(ticket_dir "$(res_dir "$1")"); for t in $(live_tickets "$td"); do echo "  waiting on $1: $(describe_ticket "$td/$t")"; done; return 0
     fi
     is_stale "$d" && flag="$flag [STALE]"
     echo "$1: $(describe "$d")$flag"
@@ -983,7 +989,7 @@ STMTS
       echo "Take it first, e.g.: agentlock acquire ${missing## } --ttl 30m --reason \"<what you are doing>\""
       echo "If it is busy, wait with --wait 15m or do something else. Release it when done."
       case "$cmd" in *\|*) echo "(If this line used 'agentlock with ... -- <command> | ...', the pipe is what tripped the guard: run the command without the pipe, or take the lock first.)" ;; esac
-      echo "(agentlock acquire <resource> ... && <command> on one line also works: the && means the command runs only once the lock is held.)"
+      echo "(agentlock acquire <resource> ... && <command> on one line also works: the && means the command runs only once the lock is held. Parentheses and braces are not tracked: 'acquire X && (a; b)' grants X to a only; take the lock in its own call before such a group.)"
       echo "Current holders:"; cmd_status
     } >&2
     exit 2

@@ -237,6 +237,27 @@ if run lock; then echo "lock"
   [ -z "$(ls "$AGENTLOCK_DIR/waits/q1" 2>/dev/null)" ] && ok "a killed waiter's ticket is gone" || bad "ticket left by a killed waiter: $(ls "$AGENTLOCK_DIR/waits/q1")"
   AGENTLOCK_OWNER=A $L acquire q1 --ttl 1m >/dev/null 2>&1; check "the holder's own re-acquire ignores the line" $? 0
   AGENTLOCK_OWNER=A $L release q1 >/dev/null
+  # free and wait under another party's quiet; the one line a waiter gets at its first blocked poll.
+  AGENTLOCK_OWNER=Q AGENTLOCK_AS=m $L acquire quiet --ttl 1m >/dev/null
+  AGENTLOCK_OWNER=B $L free q9 >/dev/null 2>&1; check "free <resource> under someone else's quiet is not free" $? 1
+  AGENTLOCK_OWNER=B $L free quiet >/dev/null 2>&1; check "free quiet under someone else's quiet is not free" $? 1
+  $L status q9 | grep -q "^q9: free, but the machine is quiet for a measurement: owner=Q:m" && ok "status <resource> under someone else's quiet says so" || bad "status under quiet: $($L status q9)"
+  AGENTLOCK_POLL=1 AGENTLOCK_OWNER=B $L acquire q9 --ttl 1m --wait 2s --quiet >"$work/wq.out" 2>"$work/wq.err"; [ ! -s "$work/wq.out" ] && grep -q "waiting for q9: machine is quiet" "$work/wq.err" && ok "the waiting line goes to stderr, and prints under --quiet too" || bad "streams: out=$(cat "$work/wq.out") err=$(cat "$work/wq.err")"
+  out=$(AGENTLOCK_POLL=1 AGENTLOCK_OWNER=B $L wait q9 2s 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "still held: owner=Q:m" && ok "wait <resource> under someone else's quiet waits and times out on the quiet" || bad "wait under quiet: rc=$rc $out"
+  out=$(AGENTLOCK_POLL=1 AGENTLOCK_OWNER=B $L acquire q9 --ttl 1m --wait 2s 2>&1); rc=$?; [ $rc = 1 ] && [ "$(printf '%s\n' "$out" | grep -c 'waiting for q9: machine is quiet for a measurement: owner=Q:m')" = 1 ] && ok "a waiter under quiet is told once what it waits for" || bad "quiet waiting line: rc=$rc $out"
+  AGENTLOCK_OWNER=Q AGENTLOCK_AS=m $L release quiet >/dev/null
+  AGENTLOCK_OWNER=B $L free q9 >/dev/null 2>&1; check "free <resource> is free again once the quiet is released" $? 0
+  AGENTLOCK_OWNER=A $L acquire q9 --ttl 1m >/dev/null
+  out=$(AGENTLOCK_POLL=1 AGENTLOCK_OWNER=B $L acquire q9 --ttl 1m --wait 3s 2>&1); rc=$?; [ $rc = 1 ] && [ "$(printf '%s\n' "$out" | grep -c 'waiting for q9: held: owner=A')" = 1 ] && ok "a waiter behind a holder is told once whom it waits for" || bad "held waiting line: rc=$rc $out"
+  ( AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W9 $L acquire q9 --ttl 1m --wait 20s >/dev/null 2>&1 ) & wq9=$!; sleep 1.5
+  out=$(AGENTLOCK_POLL=1 AGENTLOCK_OWNER=C $L acquire q9 --ttl 1m --wait 2s 2>&1); rc=$?; [ $rc = 1 ] && [ "$(printf '%s\n' "$out" | grep -c 'waiting for q9: 1 waiter(s) ahead in line')" = 1 ] && ok "a waiter joining a line is told once how many are ahead" || bad "line waiting line: rc=$rc $out"
+  AGENTLOCK_OWNER=A $L release q9 >/dev/null; wait $wq9 2>/dev/null; AGENTLOCK_OWNER=W9 $L release q9 >/dev/null
+  mkdir -p "$AGENTLOCK_DIR/lg9"; printf 'owner=old\npid=%s\nacquired=%s\nexpires=%s\nreason=legacy\n' "$$" "$(date +%s)" "$(( $(date +%s) + 600 ))" > "$AGENTLOCK_DIR/lg9/info"
+  out=$(AGENTLOCK_POLL=1 AGENTLOCK_OWNER=B $L acquire lg9 --ttl 1m --wait 2s 2>&1); rc=$?; [ $rc = 1 ] && [ "$(printf '%s\n' "$out" | grep -c 'waiting for lg9: held through a pre-0.4.0 copy: owner=old')" = 1 ] && ok "a waiter behind a pre-0.4.0 lock is told once" || bad "legacy waiting line: rc=$rc $out"
+  rm -rf "$AGENTLOCK_DIR/lg9" "$AGENTLOCK_DIR/waits/lg9"
+  AGENTLOCK_OWNER=A $L acquire q9 --ttl 1m >/dev/null
+  out=$(AGENTLOCK_POLL=1 AGENTLOCK_OWNER=M $L acquire quiet --ttl 1m --wait 2s 2>&1); rc=$?; [ $rc = 1 ] && [ "$(printf '%s\n' "$out" | grep -c 'waiting for quiet: others hold: q9')" = 1 ] && ok "a measurer waiting for quiet is told once who holds what" || bad "quiet waiting line: rc=$rc $out"
+  AGENTLOCK_OWNER=A $L release q9 >/dev/null
   # A re-acquire of an own lock refreshes but never shortens: with 1 h left, --ttl 1m leaves the expiry; --ttl 2h moves it out.
   AGENTLOCK_OWNER=A $L acquire ra --ttl 1h >/dev/null; e1=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
   out=$(AGENTLOCK_OWNER=A $L acquire ra --ttl 1m); rc=$?; e2=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
@@ -289,7 +310,7 @@ if run lock; then echo "lock"
   AGENTLOCK_OWNER=S AGENTLOCK_AS=b2 $L release sim:q >/dev/null
   AGENTLOCK_OWNER=S AGENTLOCK_AS=b2 $L free quiet; check "free: quiet held by a sibling is not free" $? 1
   AGENTLOCK_OWNER=S AGENTLOCK_AS=b1 $L free quiet; check "free: my own lock counts as free for me" $? 0
-  AGENTLOCK_OWNER=S $L free sim:nothing; check "free: an untaken resource is free" $? 0
+  AGENTLOCK_OWNER=S $L free sim:nothing; check "free: an untaken resource under a sibling's quiet is not free, as acquire would be refused (0.4.34)" $? 1
   AGENTLOCK_OWNER=S $L status >/dev/null; check "status is a report: exit 0 with locks held" $? 0
   v=$(jq -r .version "$here/.claude-plugin/plugin.json")   # an oracle independent of the tool's own reading
   [ -n "$v" ] && [ "$($L version)" = "$v" ] && ok "version prints the manifest's version ($v)" || bad "version printed '$($L version)', manifest says '$v'"
@@ -384,6 +405,7 @@ if run guard; then echo "guard"
   check "text piped into a shell keeps every segment" "$(gm Z '"echo xcrun simctl boot X | sh"')" "sim"
   check "acquire && command needs no lock held yet" "$(g Z '"agentlock acquire device:00008130 --ttl 30m --reason install && xcrun devicectl device install app --device 00008130 x.app"')" 0
   check "acquire ; command is not a grant" "$(gm Z '"agentlock acquire device:00008130 --ttl 30m; xcrun devicectl device install app --device 00008130 x.app"')" "device"
+  printf '%s' "{\"session_id\":\"Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"agentlock acquire device:00008130 --ttl 30m && (echo start; xcrun devicectl device install app --device 00008130 x.app)\"}}" | $L guard 2>&1 >/dev/null | grep -q "Parentheses and braces are not tracked" && ok "the block message says that parentheses and braces are not tracked" || bad "no parentheses hint in the block message"
   check "acquire of another resource && command still needs the right lock" "$(gm Z '"agentlock acquire sim:x --ttl 30m && xcrun devicectl device install app --device 1 x.app"')" "device"
   check "a command substitution inside an echo still runs a tool" "$(gm Z '"echo $(xcrun simctl boot X)"')" "sim"
   check "a backtick substitution inside a head still runs a tool" "$(gm Z '"head -1 `xcrun devicectl device install app --device 1 x.app`"')" "device"
