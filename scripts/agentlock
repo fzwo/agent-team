@@ -962,7 +962,7 @@ SEGL
         {
           echo "Blocked: the machine is quiet for a measurement, $(describe "$q")."
           echo "Heavy commands (builds, tests, simulators, devices, screen) wait until it is released or its TTL ends."
-          echo "Do something light meanwhile (reading, writing code, issues), or wait for it: agentlock wait quiet 30m"
+          echo "Do something light meanwhile (reading, writing code, issues), or wait for it: agentlock wait quiet 9m (repeat as needed)"
           echo "(If this is the measurement itself, run it as: AGENTLOCK_AS=<your name> agentlock with quiet -- <command>.)"
         } >&2
         exit 2
@@ -987,7 +987,7 @@ STMTS
     {
       echo "Blocked: this command needs a lock on:$missing"
       echo "Take it first, e.g.: agentlock acquire ${missing## } --ttl 30m --reason \"<what you are doing>\""
-      echo "If it is busy, wait with --wait 15m or do something else. Release it when done."
+      echo "If it is busy, wait with --wait 9m (repeat as needed) or do something else. Release it when done."
       case "$cmd" in *\|*) echo "(If this line used 'agentlock with ... -- <command> | ...', the pipe is what tripped the guard: run the command without the pipe, or take the lock first.)" ;; esac
       echo "(agentlock acquire <resource> ... && <command> on one line also works: the && means the command runs only once the lock is held.)"
       case "$cmd" in *\(*|*\{*) echo "(Parentheses and braces are not tracked: 'acquire X && (a; b)' grants X to a only; take the lock in its own call before such a group.)" ;; esac

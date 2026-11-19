@@ -389,6 +389,28 @@ if run guard; then echo "guard"
   check "a trailing backslash inside a quoted heredoc body does not swallow the terminator" "$(g Z '"cat > n.md <<'"'"'EOT'"'"'\nnote: use xcrun simctl boot \\\nEOT\necho done"')" 0
   check "an escaped backslash at the end of a line is not a continuation" "$(gm Z '"xcodebuild -scheme X\\\\\ntest"')" ""
   check "a heredoc opened on a continued line still joins with the next line" "$(gm Z '"cat <<EOT \\\n| osascript\nactivate\nEOT\necho done"')" "ui"
+  check "deleting under a simulator's data needs sim (0.4.36)" "$(gm Z '"rm -rf \"$HOME/Library/Developer/CoreSimulator/Devices/ABC-1/data/Library/Application Support/PRBPosterExtensionDataStore\""')" "sim"
+  check "moving a simulator's data needs sim" "$(gm Z '"mv ~/Library/Developer/CoreSimulator/Devices/ABC-1/data/tmp /tmp/old"')" "sim"
+  check "measuring a simulator's data needs nothing" "$(g Z '"du -sh ~/Library/Developer/CoreSimulator/Devices/ABC-1/data"')" 0
+  check "deleting the simulators' directory itself needs sim (0.4.36, review)" "$(gm Z '"rm -rf ~/Library/Developer/CoreSimulator/Devices"')" "sim"
+  check "deleting CoreSimulator itself, quoted, needs sim" "$(gm Z '"rm -rf \"$HOME/Library/Developer/CoreSimulator\""')" "sim"
+  check "sudo rm under a simulator's data needs sim" "$(gm Z '"sudo rm -rf /Users/x/Library/Developer/CoreSimulator/Devices/ABC-1/data/tmp"')" "sim"
+  check "a docker --rm with a simulator path mounted is not an rm" "$(g Z '"docker run --rm -v ~/Library/Developer/CoreSimulator/Devices/ABC-1/data:/d img"')" 0
+  check "find -delete under a simulator's data needs sim" "$(gm Z '"find ~/Library/Developer/CoreSimulator/Devices/ABC-1/data/tmp -name x -delete"')" "sim"
+  check "find without -delete under a simulator's data needs nothing" "$(g Z '"find ~/Library/Developer/CoreSimulator/Devices/ABC-1/data/tmp -name x"')" 0
+  check "rsync into a simulator's data needs sim" "$(gm Z '"rsync -a --delete /tmp/backup/ ~/Library/Developer/CoreSimulator/Devices/ABC-1/data/"')" "sim"
+  check "simctl delete needs sim (0.4.36)" "$(gm Z '"xcrun simctl delete ABC-1"')" "sim"
+  check "simctl pair needs sim" "$(gm Z '"xcrun simctl pair ABC-1 WATCH-1"')" "sim"
+  check "simctl create needs nothing (a device-set change)" "$(g Z '"xcrun simctl create Test com.apple.CoreSimulator.SimDeviceType.iPhone-17"')" 0
+  check "rm of CoreSimulator itself, unquoted, at the end of the line needs sim" "$(gm Z '"rm -rf ~/Library/Developer/CoreSimulator"')" "sim"
+  check "trash of a simulator's directory needs sim" "$(gm Z '"trash ~/Library/Developer/CoreSimulator/Devices/ABC-1"')" "sim"
+  check "rm in a subshell under a simulator's data needs sim" "$(gm Z '"(rm -rf ~/Library/Developer/CoreSimulator/Devices/ABC-1/data/tmp)"')" "sim"
+  check "a backslash-escaped rm under a simulator's data needs sim" "$(gm Z '"\\rm -rf ~/Library/Developer/CoreSimulator/Devices/ABC-1/data/tmp"')" "sim"
+  check "rmdir under a simulator's data needs sim" "$(gm Z '"rmdir ~/Library/Developer/CoreSimulator/Devices/ABC-1/data/tmp/x"')" "sim"
+  check "find -exec rm under a simulator's data needs sim" "$(gm Z '"find ~/Library/Developer/CoreSimulator/Devices/ABC-1/data -name \"*.log\" -exec rm -f {} +"')" "sim"
+  out=$(printf '%s' "{\"session_id\":\"Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"xcrun simctl boot ABC-1\"}}" | $L guard 2>&1 >/dev/null); printf '%s' "$out" | grep -q -- "--wait 9m (repeat as needed)" && ok "the block message's wait example fits one call (0.4.36)" || bad "block message wait example: $out"
+  check "simctl uninstall needs sim" "$(gm Z '"xcrun simctl uninstall ABC-1 com.example.app"')" "sim"
+  check "deleting under a simulator's data behind its acquire is granted" "$(g Z '"agentlock acquire sim:ABC-1 --ttl 10m --reason cache && rm -rf \"$HOME/Library/Developer/CoreSimulator/Devices/ABC-1/data/Library/Application Support/PRBPosterExtensionDataStore\""')" 0
   check "a heredoc opener inside quotes does not stop later joins" "$(gm Z '"echo \"<<EOT\" > x\nxcodebuild -scheme X \\\n  test"')" "sim"
   check "a here-string is not a heredoc opener and does not stop later joins" "$(gm Z '"grep x <<< foo\nxcodebuild -scheme X \\\n  test"')" "sim"
   # Config rules see only the segments that run something; acquire && command grants the lock for the line.
@@ -550,6 +572,7 @@ if run guard; then echo "guard"
   check "osascript with a heredoc needs ui" "$(g Z '"osascript <<EOT\ntell application \"Finder\"\nEOT"')" 2
   AGENTLOCK_OWNER=S3 AGENTLOCK_AS=b1 $L acquire quiet --ttl 1m >/dev/null
   check "a builder's quiet blocks its own session's builds too (the guard cannot tell whose command it is)" "$(g S3 '"xcodebuild -scheme X build"')" 2
+  out=$(printf '%s' "{\"session_id\":\"S4\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"xcodebuild -scheme X build\"}}" | $L guard 2>&1 >/dev/null); printf '%s' "$out" | grep -q "agentlock wait quiet 9m (repeat as needed)" && ok "the quiet block's wait example fits one call (0.4.36)" || bad "quiet block wait example: $out"
   check "the measurer runs its command through agentlock with quiet" "$(g S3 '"AGENTLOCK_AS=b1 agentlock with quiet -- swift test"')" 0
   check "the measurer's command piped into a filter passes" "$(g S3 '"AGENTLOCK_AS=b1 agentlock with quiet -- swift test | tee /tmp/t.log"')" 0
   check "with quiet covers the simulator too: the measurer holds the machine" "$(g S3 '"AGENTLOCK_AS=b1 agentlock with quiet -- xcodebuild test -scheme X -destination \"platform=iOS Simulator,name=iPhone 16e\" 2>&1 | xcpretty"')" 0

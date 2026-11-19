@@ -15,14 +15,20 @@
 
 # Anything that takes the screen, keyboard focus or the simulator window.
 ui	\b(screencapture|cliclick)\b|\bosascript(\s+(-e|-l|\S+\.(scpt|applescript))|\s*<<)|(^|[;|&({`]|\b(if|then|else|do|env|nohup|time|exec|caffeinate|sudo|xargs)\s+)\s*osascript\b|open -a "?'?Simulator|open -b com\.apple\.dt\.Devices|DeviceHub|xcodebuild[^|;&]*platform=macOS[^|;&]*\s(test|test-without-building)(\s|$)|xcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*platform=macOS
-# iOS simulators (the verbs that change or read a device; `list`, `bootstatus` and friends need none), and a test
+# iOS simulators (the verbs that change a device or read its screen; `list`, `bootstatus`, `get_app_container` and the
+# other reads need none, and so do `create` and `runtime add|delete`, which change the device set, not a device), and a test
 # run on a simulator-family destination (platform=iOS/tvOS/watchOS/visionOS, a destination starting with id=/name=/OS=, or no
 # destination at all, which an iOS scheme resolves to a simulator; uppercase BUILD_SETTING=value pairs do not
 # count as a destination; a macOS-only project edits this, since the rule cannot know the scheme): it serialises
 # with other simulator users, not with the screen. Each keyed form is written twice, for the action before and
 # after the destination (`xcodebuild test -destination …` and `xcodebuild -destination … test`)
-# (0.4.7; before, it took ui). A macOS test run (platform=macOS) drives a window: ui above, and not sim.
-sim	\bsimctl\s+(boot|shutdown|install|launch|terminate|io|erase|openurl)\b|xcodebuild[^|;&]*(platform=(iOS|tvOS|watchOS|visionOS|xrOS)|-destination[[:space:]]+['"]?(id|name|OS)=)[^|;&]*\s(test|test-without-building)(\s|$)|xcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*(platform=(iOS|tvOS|watchOS|visionOS|xrOS)|-destination[[:space:]]+['"]?(id|name|OS)=)|xcodebuild([^|;&=]|[A-Z_][A-Z0-9_]*=[^[:space:]|;&]*)*\s(test|test-without-building)(\s([^|;&=]|[A-Z_][A-Z0-9_]*=[^[:space:]|;&]*)*)?(\||;|&|$)
+# (0.4.7; before, it took ui). A macOS test run (platform=macOS) drives a window: ui above, and not sim. Deleting, moving
+# or syncing into the CoreSimulator directory or anything under it (`rm`, `rmdir`, `mv`, `trash`, `rsync`, `find … -delete`
+# or `-exec rm`, with the path on the command's own segment) takes sim too: a builder's next call once deleted a simulator's
+# caches while its lock wait was still in line (0.4.36). The path must be on the deleting command's segment: `cd <that
+# dir> && rm ./x`, `… | xargs rm` and a `for` loop over the paths are not seen, so under a simulator's data a deletion
+# spells the full path. Copies into it (`cp`, `ditto`, `tar x`) are not covered.
+sim	\bsimctl\s+(boot|shutdown|install|uninstall|install_app_data|launch|terminate|io|erase|openurl|delete|clone|rename|upgrade|privacy|ui|status_bar|location|push|spawn|addmedia|keychain|pair|unpair|pair_activate|icloud_sync|pbcopy|pbsync|logverbose)\b|xcodebuild[^|;&]*(platform=(iOS|tvOS|watchOS|visionOS|xrOS)|-destination[[:space:]]+['"]?(id|name|OS)=)[^|;&]*\s(test|test-without-building)(\s|$)|xcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*(platform=(iOS|tvOS|watchOS|visionOS|xrOS)|-destination[[:space:]]+['"]?(id|name|OS)=)|xcodebuild([^|;&=]|[A-Z_][A-Z0-9_]*=[^[:space:]|;&]*)*\s(test|test-without-building)(\s([^|;&=]|[A-Z_][A-Z0-9_]*=[^[:space:]|;&]*)*)?(\||;|&|$)|(^|[[:space:]/(\\])(rm|rmdir|mv|trash|rsync)[[:space:]][^|;&]*CoreSimulator(/|["'[:space:]]|$)|(^|[[:space:]/(\\])find[[:space:]][^|;&]*CoreSimulator(/|["'[:space:]]|$)[^|;&]*(-delete|-exec[[:space:]]+(rm|rmdir|mv|trash)[[:space:]])
 
 # Physical devices, and a test run on one (platform=iOS followed by a comma, not "Simulator"), which takes device as well as sim.
 # devicectl's reads (`list …`, `device info …`) need no lock; its acting verbs are listed (Xcode 27.2, 2026-11: a new verb
