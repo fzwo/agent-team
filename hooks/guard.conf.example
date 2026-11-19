@@ -11,7 +11,9 @@
 # against the segments that run something: a segment whose command only reads or prints text
 # (grep, echo, cat, sed …) is not matched unless it holds a $(…) or a shell reads its output.
 # Separators are removed, so a rule must not depend on seeing | ; or & around a command.
-# `agentlock acquire X … && <command>` counts as holding X for the rest of that statement.
+# `agentlock acquire X … && <command>` counts as holding X for the rest of that statement, a group chained with &&
+# included (`acquire X && { a; b; }` grants X to a and b, a lock taken inside the group only to its next `;`; needs
+# python3, the usual case on a Mac); a group after `;` or `||` gets nothing (0.4.37).
 
 # Anything that takes the screen, keyboard focus or the simulator window.
 ui	\b(screencapture|cliclick)\b|\bosascript(\s+(-e|-l|\S+\.(scpt|applescript))|\s*<<)|(^|[;|&({`]|\b(if|then|else|do|env|nohup|time|exec|caffeinate|sudo|xargs)\s+)\s*osascript\b|open -a "?'?Simulator|open -b com\.apple\.dt\.Devices|DeviceHub|xcodebuild[^|;&]*platform=macOS[^|;&]*\s(test|test-without-building)(\s|$)|xcodebuild[^|;&]*\s(test|test-without-building)\s[^|;&]*platform=macOS

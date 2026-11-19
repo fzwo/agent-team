@@ -118,7 +118,7 @@ if [ -f "$HOME/.agentlock/guard.conf" ]; then
     if [ -z "$m" ]; then missing="$missing $name"; elif [ "$m" != "$re" ]; then differs="$differs $name"; fi
   done < "$ex"
   if [ -z "$differs$missing" ]; then echo "kept existing ~/.agentlock/guard.conf; every rule of this version's example is in it unchanged"
-  else echo "kept existing ~/.agentlock/guard.conf; against this version's example it${differs:+ differs in:$differs;}${missing:+ lacks:$missing;} compare with $ex and merge your local edits into a fresh copy"; fi
+  else echo "kept existing ~/.agentlock/guard.conf; against this version's example it${differs:+ differs in:$differs;}${missing:+ lacks:$missing;} compare with $ex and merge your local edits into a fresh copy, or, when your copy has no local edits, adopt this version's rules: cp ~/.agentlock/guard.conf ~/.agentlock/guard.conf.bak && cp $ex ~/.agentlock/guard.conf && agentlock check-conf (a kept copy ran 0.4.8 rules under 0.4.35 for ten versions while this line reported the difference)"; fi
   "$src" check-conf || echo "  fix the rules above before running agents; the guard blocks on a bad rule" >&2
 else
   cp "$(dirname "$src")/../hooks/guard.conf.example" "$HOME/.agentlock/guard.conf"

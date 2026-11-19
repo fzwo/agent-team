@@ -840,6 +840,81 @@ def cut(m):
 # Each statement is cut on its own, so an unbalanced quote in one (an unclosed span, a backtick span that ends
 # mid-string) cannot pair with a quote in another and swallow the command between.
 c="\n".join(re.sub(r"\\.|\"((?:[^\"\\]|\\.)*)\"|\$\x27((?:[^\x27\\]|\\.)*)\x27|\x27([^\x27]*)\x27", cut, st, flags=re.S) for st in statements)
+# A group chained to what precedes it with && runs only when that succeeded, so `acquire X && { a; b; }` holds X
+# for a and b. Inside such a group (and the groups nested in it, chained or not) the separators (; || & and
+# newlines) become `&& GROUPSEP<depth> &&`, and the group itself is wrapped in GROUPOPEN<depth> and
+# GROUPCLOSE<depth>, so the segment loop below can keep the grants made before the group for every command in it
+# and end, at a separator, the grants made inside the group at that depth or deeper (a `;` in bash ends an && list,
+# so `{ acquire Y && a; b; }` runs b whether or not Y was taken). A group not after && keeps its separators, so its
+# commands stay statements of their own. Quoted text is already one word, but a backslash pair is skipped as one
+# unit (an escaped apostrophe), $((…)) is arithmetic, and <(…) and >(…) are not groups. A command substitution inside a
+# group was lifted out above and stays a statement of its own, as at the top level.
+def regroup(text):
+    n = len(text)
+    def skip_quote(i):   # i at a quote: the index after its close (double and ANSI-C quotes take backslash pairs)
+        q = text[i]; esc = q == "\"" or (i > 0 and text[i-1] == "$"); i += 1
+        while i < n and text[i] != q:
+            i += 2 if esc and text[i] == "\\" else 1
+        return i + 1
+    def skip_balanced(i):   # i at an opener that is not a group: the index after its matching closer
+        open_ch = text[i]; close = ")" if open_ch == "(" else "}"; d = 0
+        while i < n:
+            ch = text[i]
+            if ch in "\"\x27": i = skip_quote(i); continue
+            if ch == "\\": i += 2; continue
+            if ch == open_ch: d += 1
+            elif ch == close:
+                d -= 1
+                if d == 0: return i + 1
+            i += 1
+        return n
+    def word_at(i, w):   # the keyword w at i, at a command position: after a separator, an opener, the start, or then/else/do/elif
+        if not (text.startswith(w, i) and (i + len(w) >= n or text[i+len(w)] in " \t\n;&|(){}")): return False
+        j = i - 1
+        while j >= 0 and text[j] in " \t": j -= 1
+        if j < 0 or text[j] in "\n;&|(){}": return True
+        k = j
+        while k >= 0 and text[k].isalpha(): k -= 1
+        return text[k+1:j+1] in ("then", "else", "do", "elif") and (k < 0 or text[k] in " \t\n;&|(){}")
+    def group(i, d):   # i at the opener of a group at depth d: (its rewritten text, the index after its closer)
+        open_ch = text[i]; close = "}" if open_ch == "{" else ")"
+        out = ["GROUPOPEN%d && %s" % (d, open_ch)]; i += 1; in_case = 0
+        while i < n:
+            ch = text[i]
+            if ch in "\"\x27": j = skip_quote(i); out.append(text[i:j]); i = j; continue
+            if ch == "\\": out.append(text[i:i+2]); i += 2; continue
+            if text.startswith("$((", i) or (ch == "(" and i > 0 and text[i-1] in "<>$"):
+                j = skip_balanced(i + 1 if text.startswith("$((", i) else i); out.append(text[i:j]); i = j; continue   # $(( : from the outer (, so its ) does not close the group
+            # Inside case … esac the parentheses of a pattern open and close nothing (`1)`, `(1)`), and `;;` separates as `;` does.
+            if word_at(i, "case"): in_case += 1
+            elif word_at(i, "esac"): in_case -= 1
+            if in_case > 0 and ch in "()": out.append(ch); i += 1; continue
+            if ch in "{(":
+                inner, i = group(i, d + 1); out.append(inner); continue
+            if ch == close: out.append("%s && GROUPCLOSE%d && " % (close, d)); return "".join(out), i + 1   # the trailing &&: what follows the closer is a segment of its own, never dropped with the marker
+            if text.startswith("||", i): out.append(" && GROUPSEP%d && " % d); i += 2; continue
+            if text.startswith("&&", i): out.append("&&"); i += 2; continue
+            if ch in ";\n" or (ch == "&" and (i == 0 or text[i-1] not in "<>&") and (i + 1 >= n or text[i+1] not in ">&")):
+                out.append(" && GROUPSEP%d && " % d); i += 1
+                while i < n and text[i] in ";&": i += 1   # `;;`, `;&`, `;;&` of a case: one separator
+                continue
+            out.append(ch); i += 1
+        out.append(" && GROUPCLOSE%d && " % d)   # unclosed: bash runs nothing of it, the grant reaches its end
+        return "".join(out), n
+    out, i = [], 0
+    while i < n:
+        ch = text[i]
+        if ch in "\"\x27": j = skip_quote(i); out.append(text[i:j]); i = j; continue
+        if ch == "\\": out.append(text[i:i+2]); i += 2; continue
+        m = re.compile(r"&&\s*(?=[({])").match(text, i)
+        if m:
+            inner, i = group(m.end(), 1); out.append("&& " + inner); continue   # one space: a newline here would split the statement
+        out.append(ch); i += 1
+    return "".join(out)
+# A newline after &&, || or | continues the list (bash reads on), so it is one statement: `acquire X &&` on one line
+# and the command on the next was blocked before (0.4.37).
+c=re.sub(r"(&&|\|\||\|)[ \t]*\n[ \t]*", r"\1 ", c)
+c=regroup(c)
 print(c)' 2>/dev/null)
     sid=$(printf '%s' "$input" | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""))' 2>/dev/null)
   elif command -v jq >/dev/null 2>&1; then
@@ -880,8 +955,14 @@ SEGS
   # lifted out as statements of their own before this point; the substitution check below is a safety net.)
   # `agentlock acquire X … && <command>` takes the lock before the command, and && stops the command when the
   # acquire fails, so X counts as held for the segments after it in that statement, and no further: `;` and
-  # `||` end the statement and the grant, and a segment before the acquire gets nothing. Parentheses are not
-  # tracked, so `acquire X && (a; b)` grants X to `a` only; take the lock in its own call for such a chain.
+  # `||` end the statement and the grant, and a segment before the acquire gets nothing. A group chained with &&
+  # (`acquire X && { a; b; }`, `&& (a; b)`) runs only once the acquire succeeded, so the python path rewrites the
+  # separators inside it to `&& GROUPSEP<depth> &&` between GROUPOPEN and GROUPCLOSE markers: the grant reaches
+  # every command in the group (a command substitution inside it excepted: lifted out, it is a statement of its
+  # own, as at the top level), and a lock taken inside the group holds only to the group's next separator at that
+  # depth or shallower, since bash's `;` ends the && list (0.4.37; before, `(a; b)` granted X to `a` only). A group
+  # after `;` or `||` is not chained and gets nothing. The jq-only path (no python3) does not rewrite: there a
+  # group gets nothing, as before.
   local keep_all="" w stmts stmt segl marker grants res re missing="" badrule="" q TAB rule_text; q=$(quiet_by_other); TAB=$(printf '\t')
   # Does a grant cover every match of rule $2 for resource $1? A grant is res@start (acquire: from the acquire on) or
   # res@start@end (with: to the && that ends its pipe chain). A grant of quiet covers every resource: the measurer
@@ -893,7 +974,7 @@ SEGS
         && { [ -z "$ge" ] || ! printf '%s' "$rule_text" | tail -c "+$((ge + 1))" | grep -Eq -- "$2"; } && return 0 ;;
     esac; done; return 1
   }
-  first_word() { printf '%s' "$1" | sed -E 's/^[[:space:]]*[(]*[[:space:]]*(((env|nohup|time|exec|caffeinate|sudo|nice|command)([[:space:]]+-[A-Za-z0-9]+)*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)[[:space:]]+)*//' | awk '{print $1}' | sed 's|.*/||'; }
+  first_word() { printf '%s' "$1" | sed -E 's/^[[:space:]]*[({]*[[:space:]]*(((env|nohup|time|exec|caffeinate|sudo|nice|command)([[:space:]]+-[A-Za-z0-9]+)*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)[[:space:]]+)*//' | awk '{print $1}' | sed 's|.*/||'; }
   while IFS= read -r seg; do
     [ -n "$(printf '%s' "$seg" | tr -d '[:space:]()')" ] || continue
     case "$(first_word "$seg")" in sh|bash|zsh|dash|ksh|eval|xargs|find|source|.) keep_all=1 ;; esac
@@ -913,19 +994,33 @@ SEGS
     segl=$(printf 'START\t%s' "$stmt" | sed -E "s/&&/\\
 AND${TAB}/g; s/\\|/\\
 PIPE${TAB}/g")
-    grants=""; rule_text=""; local pending_grant="" open_with="" ow off
+    grants=""; rule_text=""; local pending_grant="" open_with="" ow off depth=0 open_acq="" oa d keep
+    # An acquire's grant is committed at the && after it: at depth 0 open-ended (res@start), inside a chained group
+    # with its depth (res@start:depth) until a separator or close of that depth or shallower ends it (res@start@end).
+    commit() { [ -z "$pending_grant" ] || { if [ "$depth" -gt 0 ]; then open_acq="$open_acq $pending_grant:$depth"; else grants="$grants $pending_grant"; fi; }; pending_grant=""; }
+    end_from() { keep=""; for oa in $open_acq; do if [ "${oa##*:}" -ge "$1" ]; then grants="$grants ${oa%:*}@$off"; else keep="$keep $oa"; fi; done; open_acq="$keep"; }
     while IFS=$'\t' read -r marker seg; do
       [ -n "$(printf '%s' "$seg" | tr -d '[:space:]()')" ] && {
+        w=$(first_word "$seg")
+        case "$w" in GROUPOPEN[0-9]*|GROUPSEP[0-9]*|GROUPCLOSE[0-9]*)   # the markers regroup wrote: see above
+          d=${w##*[A-Z]}; off=$(printf '%s' "$rule_text" | wc -c | tr -d ' ')
+          case "$w" in
+            GROUPOPEN*) commit; depth=$d ;;                            # `acquire X && {`: X is committed first, outside
+            GROUPSEP*) pending_grant=""; end_from "$d"; depth=$d ;;    # `;` inside: ends what was taken inside, at this depth or deeper
+            GROUPCLOSE*) commit; end_from "$d"; depth=$((d - 1)) ;;
+          esac
+          for ow in $open_with; do grants="$grants $ow@$off"; done; open_with=""   # a with's chain ends here too
+          continue ;;
+        esac
         if [ "$marker" = AND ]; then
-          [ -z "$pending_grant" ] || grants="$grants $pending_grant"
+          commit
           # `with` releases its resource when its command ends, so its grant ends with the pipe chain, at this &&:
           # `with X -- a | b && c` grants X to a and b, not to c (unlike acquire, which leaves the lock held).
           off=$(printf '%s' "$rule_text" | wc -c | tr -d ' '); for ow in $open_with; do grants="$grants $ow@$off"; done; open_with=""
         fi
         pending_grant=""
-        w=$(first_word "$seg")
         if [ "$w" = agentlock ]; then
-          local al_args al_kind al_res; al_args=$(printf '%s' "$seg" | sed -E 's/^[[:space:]]*[(]*[[:space:]]*(((env|nohup|time|exec|caffeinate|sudo|nice|command)([[:space:]]+-[A-Za-z0-9]+)*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)[[:space:]]+)*//')
+          local al_args al_kind al_res; al_args=$(printf '%s' "$seg" | sed -E 's/^[[:space:]]*[({]*[[:space:]]*(((env|nohup|time|exec|caffeinate|sudo|nice|command)([[:space:]]+-[A-Za-z0-9]+)*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)[[:space:]]+)*//')
           # The resource is the first word after the options (`acquire --ttl 1m sim:x` names sim:x, not --ttl).
           read -r al_kind al_res <<<"$(printf '%s' "$al_args" | awk '$2 == "acquire" || $2 == "with" { for (i = 3; i <= NF; i++) {
               if ($i == "--") exit; if ($i == "--ttl" || $i == "--reason") { i++; continue }
@@ -949,6 +1044,7 @@ PIPE${TAB}/g")
 $segl
 SEGL
     for ow in $open_with; do grants="$grants $ow@"; done   # a with whose chain reaches the end of the statement
+    for oa in $open_acq; do grants="$grants ${oa%:*}"; done   # an acquire inside an unclosed group: to the end
     # A grant covers the text after the acquire segment: cut rule_text there for the granted resources' check.
     while IFS=$'\t' read -r res re || [ -n "$res" ]; do
       case "$res" in ''|\#*) continue ;; esac
@@ -990,7 +1086,10 @@ STMTS
       echo "If it is busy, wait with --wait 9m (repeat as needed) or do something else. Release it when done."
       case "$cmd" in *\|*) echo "(If this line used 'agentlock with ... -- <command> | ...', the pipe is what tripped the guard: run the command without the pipe, or take the lock first.)" ;; esac
       echo "(agentlock acquire <resource> ... && <command> on one line also works: the && means the command runs only once the lock is held.)"
-      case "$cmd" in *\(*|*\{*) echo "(Parentheses and braces are not tracked: 'acquire X && (a; b)' grants X to a only; take the lock in its own call before such a group.)" ;; esac
+      case "$cmd" in *\(*|*\{*)
+        if command -v python3 >/dev/null 2>&1; then echo "(A group chained to the acquire with && is covered: 'acquire X && { a; b; }' grants X to a and b. A group after ';' or '||', or a lock taken inside the group and followed by ';', is not: take the lock in its own call before such a group.)"
+        else echo "(Without python3 the guard does not follow a lock into a group: 'acquire X && (a; b)' grants X to a only; take the lock in its own call before such a group.)"; fi ;;
+      esac
       echo "Current holders:"; cmd_status
     } >&2
     exit 2

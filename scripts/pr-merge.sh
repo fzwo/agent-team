@@ -1,11 +1,15 @@
 #!/bin/bash
 # Merge a PR only when it is safe to: GitHub knows it is mergeable, and the branch holds the base it lands on.
-#   pr-merge.sh <pr-number> [--wait-mergeable 90] [--method merge|squash|rebase] [--dry-run] [--strict]
+#   pr-merge.sh <pr-number> [--wait-mergeable 90] [--method merge|squash|rebase] [--dry-run] [--strict] [--unaffected <path>]...
 # Refuses (exit 1) when the PR is not OPEN; when the base branch has commits the PR's head does not (two PRs each
 # reviewed clean against an older main once broke main for an hour: one added an exhaustive switch, the other an
 # enum case; merge the base into the branch, rerun the build and the tests the PR touches, push, run this again),
 # unless every file those commits touch is a document (`*.md`, `.agent-team/`, `design/`, `docs/`), which cannot
-# change a build (a shift was refused six times for state-file and design-doc commits); --strict refuses those too;
+# change a build (a shift was refused six times for state-file and design-doc commits); --strict refuses those too.
+# --unaffected <path> (repeatable) names a directory whose changes cannot reach this PR's build, as the project's
+# CLAUDE.md lists its independent targets (a shift rebuilt for nearly every merge while main's new commits touched
+# only the other app): commits under those paths count as documents do, noted and not refused; a path the PR itself
+# changes is refused as --unaffected, since the PR's build sees it;
 # when GitHub reports CONFLICTING; and when mergeability is still UNKNOWN after --wait-mergeable seconds (GitHub
 # computes it lazily after a push; never merge on UNKNOWN; an error from gh counts as unknown until then). The base
 # check runs again after the wait, since the base can move during it, and the merge names the head commit it
@@ -20,22 +24,25 @@
 # removed on exit): run it from your shift's checkout, not a shared one. PR_MERGE_POLL (seconds between checks,
 # default 5) is for the tests.
 set -eu
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
 # The PR number and the options in any order (`--dry-run 1141` and `1141 --dry-run` both work; the first form was a usage error once).
-pr=""; wait_m=90; method=merge; dry=""; strict=""; noted=""
+pr=""; wait_m=90; method=merge; dry=""; strict=""; noted=""; unaff=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --wait-mergeable) wait_m="${2:-}"; case "$wait_m" in ''|*[!0-9]*) echo "--wait-mergeable needs a number of seconds" >&2; exit 2 ;; esac; shift 2 ;;
     --method) method="${2:-}"; case "$method" in merge|squash|rebase) ;; *) echo "--method is merge, squash or rebase" >&2; exit 2 ;; esac; shift 2 ;;
     --dry-run) dry=1; shift ;;
     --strict) strict=1; shift ;;
+    --unaffected) p="${2:-}"; case "$p" in ''|-*) echo "--unaffected needs a path (a directory the PR's build cannot see)" >&2; exit 2 ;; esac
+       p=$(printf '%s' "$p" | sed 's|^\./||; s|/*$||'); case "$p" in ''|.|..|/*|../*) echo "--unaffected: a directory inside the repository, not the root or a path outside it" >&2; exit 2 ;; esac; unaff="$unaff$p/
+"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
-    *) case "$1" in *[!0-9]*) echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run] [--strict]" >&2; exit 2 ;; esac
+    *) case "$1" in *[!0-9]*) echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run] [--strict] [--unaffected <path>]..." >&2; exit 2 ;; esac
        [ -z "$pr" ] || { echo "pr-merge.sh: one PR number, not two ($pr and $1)" >&2; exit 2; }; pr="$1"; shift ;;
   esac
 done
-[ -n "$pr" ] || { echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run] [--strict]" >&2; exit 2; }
+[ -n "$pr" ] || { echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run] [--strict] [--unaffected <path>]..." >&2; exit 2; }
 poll="${PR_MERGE_POLL:-5}"
 state=$(gh pr view "$pr" --json state -q .state) || { echo "pr-merge.sh: cannot read #$pr" >&2; exit 1; }
 [ "$state" = OPEN ] || { echo "pr-merge.sh: #$pr is ${state:-unreadable}, not OPEN; nothing to merge" >&2; exit 1; }
@@ -49,21 +56,33 @@ refresh() {
   git fetch -q origin "+refs/heads/$base:$rb" "+refs/heads/$head:$rh" \
     || { echo "pr-merge.sh: cannot fetch $base and $head from origin; run this from the project checkout" >&2; exit 1; }
   behind=$(git rev-list --count "$rh..$rb")
+  # A path the PR itself changes is one its build sees: --unaffected cannot name it (a flag copied from another PR's merge).
+  if [ -n "$unaff" ] && [ "$behind" -gt 0 ]; then
+    own=$(git -c core.quotePath=off diff --no-renames --name-only "$rb...$rh" -- | awk -v u="$unaff" 'BEGIN { n = split(u, a, "\n") } { for (i = 1; i <= n; i++) if (a[i] != "" && index($0, a[i]) == 1) { print; exit } }')
+    [ -z "$own" ] || { echo "pr-merge.sh: refusing: --unaffected names a path #$pr ($head) itself changes ($own); a directory the PR touches is one its build sees. Drop that --unaffected, or merge $base in and rerun the build." >&2; exit 1; }
+  fi
   if [ "$behind" -gt 0 ]; then
     # Documents cannot change a build: when every file the missing commits touch is one, the merge goes on and says so.
     # No rename detection (a code file moved into docs/ would show under its new name only) and no path quoting.
     files=$(git -c core.quotePath=off diff --no-renames --name-only "$rh...$rb" --)
     code=$(printf '%s\n' "$files" | grep -Ev '^$|(^|/)[^/]*\.md$|^\.agent-team/|^design/|^docs/' || true)
+    # A file under a path named --unaffected is outside this PR's build, as the caller says: counted as a document is.
+    kind="documents only"
+    if [ -n "$unaff" ] && [ -n "$code" ]; then
+      rest=$(printf '%s\n' "$code" | awk -v u="$unaff" 'BEGIN { n = split(u, a, "\n") } { for (i = 1; i <= n; i++) if (a[i] != "" && index($0, a[i]) == 1) next; print }')
+      [ "$rest" = "$code" ] || kind="documents and --unaffected paths only"
+      code="$rest"
+    fi
     shown=$(printf '%s\n' "$files" | tr '\n' ' ' | sed 's/ $//'); [ -n "$shown" ] || shown="no files"
     if [ -n "$code" ]; then
       echo "pr-merge.sh: refusing: origin/$base has $behind commit(s) that #$pr ($head) does not, touching code ($(printf '%s\n' "$code" | head -1)$( [ "$(printf '%s\n' "$code" | grep -c .)" -gt 1 ] && printf ' …' )). Merge $base into $head, rerun the build and the tests the PR touches, push, then run this again. (Two PRs each clean against an older $base once broke it.)" >&2
       exit 1
     fi
     if [ -n "$strict" ]; then
-      echo "pr-merge.sh: refusing under --strict: origin/$base has $behind commit(s) that #$pr ($head) does not, touching documents only ($shown). Merge $base into $head, push, then run this again." >&2
+      echo "pr-merge.sh: refusing under --strict: origin/$base has $behind commit(s) that #$pr ($head) does not, touching $kind ($shown). Merge $base into $head, push, then run this again." >&2
       exit 1
     fi
-    [ -n "$noted" ] || echo "note: origin/$base has $behind commit(s) that #$pr ($head) does not, touching documents only ($shown); going on, since a document cannot change a build (--strict refuses this too)."
+    [ -n "$noted" ] || echo "note: origin/$base has $behind commit(s) that #$pr ($head) does not, touching $kind ($shown); going on, since none of them can change this PR's build (--strict refuses this too)."
     noted=1
   fi
 }
