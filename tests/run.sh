@@ -1229,6 +1229,19 @@ case "$*" in
 esac
 GH
   chmod +x "$mg/bin/gh"
+  # An awk that refuses a newline inside a -v value, as macOS's BSD awk (20200816) does: every --unaffected call exited 2
+  # on the Mac in 0.4.37 while Linux awk took the newline-joined list. Otherwise the real awk.
+  real_awk=$(command -v awk); cat > "$mg/bin/awk" <<AWK
+#!/bin/bash
+prev=""; for a in "\$@"; do
+  if [ "\$prev" = -v ]; then case "\$a" in *\$'\n'*) echo "awk: newline in string \${a%%\$'\n'*}..." >&2; exit 2 ;; esac; fi
+  case "\$a" in -v) prev=-v ;; *) prev="" ;; esac
+done
+exec "$real_awk" "\$@"
+AWK
+  chmod +x "$mg/bin/awk"
+  ( PATH="$mg/bin:$PATH" awk -v u="$(printf 'a\nb')" 'BEGIN { }' ) >/dev/null 2>&1; check "merge: the suite's BSD-like awk refuses a newline in a -v value (the stub works)" $? 2
+  ( PATH="$mg/bin:$PATH" awk -v u="ab" 'BEGIN { print u }' ) 2>/dev/null | grep -q '^ab$' && ok "merge: the stub awk passes a one-line -v value to the real awk" || bad "stub awk broke a plain -v"
   git init -q --bare "$mg/origin.git" && git -C "$mg/origin.git" symbolic-ref HEAD refs/heads/main
   gitm clone -q "$mg/origin.git" "$mg/co" 2>/dev/null; ( cd "$mg/co" && gitm commit -q --allow-empty -m base1 && gitm push -q origin HEAD:main && gitm checkout -q -b feature && gitm commit -q --allow-empty -m f1 && gitm push -q origin feature && gitm checkout -q main )
   gitm clone -q "$mg/origin.git" "$mg/other" 2>/dev/null   # another agent's clone: its pushes are not in co's origin/* until fetched

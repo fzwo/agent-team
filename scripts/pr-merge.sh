@@ -58,7 +58,9 @@ refresh() {
   behind=$(git rev-list --count "$rh..$rb")
   # A path the PR itself changes is one its build sees: --unaffected cannot name it (a flag copied from another PR's merge).
   if [ -n "$unaff" ] && [ "$behind" -gt 0 ]; then
-    own=$(git -c core.quotePath=off diff --no-renames --name-only "$rb...$rh" -- | awk -v u="$unaff" 'BEGIN { n = split(u, a, "\n") } { for (i = 1; i <= n; i++) if (a[i] != "" && index($0, a[i]) == 1) { print; exit } }')
+    # The list goes through the environment: BSD awk (macOS) refuses a newline in a -v value ("newline in string"), and
+    # every --unaffected call exited 2 on the Mac in 0.4.37.
+    own=$(git -c core.quotePath=off diff --no-renames --name-only "$rb...$rh" -- | PM_UNAFF="$unaff" awk 'BEGIN { n = split(ENVIRON["PM_UNAFF"], a, "\n") } { for (i = 1; i <= n; i++) if (a[i] != "" && index($0, a[i]) == 1) { print; exit } }')
     [ -z "$own" ] || { echo "pr-merge.sh: refusing: --unaffected names a path #$pr ($head) itself changes ($own); a directory the PR touches is one its build sees. Drop that --unaffected, or merge $base in and rerun the build." >&2; exit 1; }
   fi
   if [ "$behind" -gt 0 ]; then
@@ -69,7 +71,7 @@ refresh() {
     # A file under a path named --unaffected is outside this PR's build, as the caller says: counted as a document is.
     kind="documents only"
     if [ -n "$unaff" ] && [ -n "$code" ]; then
-      rest=$(printf '%s\n' "$code" | awk -v u="$unaff" 'BEGIN { n = split(u, a, "\n") } { for (i = 1; i <= n; i++) if (a[i] != "" && index($0, a[i]) == 1) next; print }')
+      rest=$(printf '%s\n' "$code" | PM_UNAFF="$unaff" awk 'BEGIN { n = split(ENVIRON["PM_UNAFF"], a, "\n") } { for (i = 1; i <= n; i++) if (a[i] != "" && index($0, a[i]) == 1) next; print }')
       [ "$rest" = "$code" ] || kind="documents and --unaffected paths only"
       code="$rest"
     fi
