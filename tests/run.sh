@@ -540,8 +540,10 @@ if run guard; then echo "guard"
   g S1 '"xcrun simctl boot X"' >/dev/null; left=$(AGENTLOCK_OWNER=S1 $L status sim:x | sed 's/.* \([0-9]*\)s left.*/\1/')
   [ "$left" -ge 9 ] && ok "a guarded command refreshed the lock to its full ttl ($left s left)" || bad "guarded command did not refresh: $left s left"
   AGENTLOCK_OWNER=S1 $L release-all >/dev/null; AGENTLOCK_OWNER=S1 $L acquire sim:x --ttl 3s >/dev/null; sleep 1
-  g S1 '"xcrun simctl boot X"' >/dev/null; left=$(AGENTLOCK_OWNER=S1 $L status sim:x | sed 's/.* \([0-9]*\)s left.*/\1/')
-  [ "$left" -le 2 ] && ok "a lock in its last seconds is not refreshed (a waiter may be taking it over)" || bad "near-expiry lock refreshed: $left s left"
+  # The remainder is read strictly (a number, negative included): under a load average above 80 the three seconds ran out
+  # before the read-back, status said "-1s left [STALE]", and the old pattern took the whole line (the Mac, 2026-11-20).
+  g S1 '"xcrun simctl boot X"' >/dev/null; st=$(AGENTLOCK_OWNER=S1 $L status sim:x); left=$(printf '%s' "$st" | sed -n 's/.* \(-\{0,1\}[0-9][0-9]*\)s left.*/\1/p')
+  [ -n "$left" ] && [ "$left" -le 2 ] && ok "a lock in its last seconds is not refreshed (a waiter may be taking it over)" || bad "near-expiry lock refreshed: $st"
   AGENTLOCK_OWNER=S1 $L release-all >/dev/null; AGENTLOCK_OWNER=S1 $L acquire sim:x --ttl 3s >/dev/null; sleep 4
   AGENTLOCK_OWNER=S1 $L check sim:x; check "control: without a guarded command the lock expires" $? 1
   # Two builders of one session on two simulators: the guarded command refreshes every family lock the session holds.
