@@ -109,7 +109,7 @@ Recommendation: <one line, or "none">
 Blocking: <what waits, or "nothing">
 ```
 
-File it assigned to the owner: `gh issue create --label owner --assignee @me …` (both agents work under the owner's account, so `@me` is the owner). An `owner` issue needs them; it shows in their assigned list. A `decision` issue is informative and is not assigned. A `bug` the owner files comes through the Bug template, untagged, and is engineering's to take in its queue order.
+File it assigned to the owner: `gh issue create --label owner --assignee @me` on a Mac, or, in a cloud session where `gh issue` is refused, `gh api -X POST repos/{owner}/{repo}/issues -f title=… -f body=… -f 'labels[]=owner' -f 'assignees[]=<the owner's login>'` (both agents work under the owner's account, so `@me` is the owner). An `owner` issue needs them; it shows in their assigned list. A `decision` issue is informative and is not assigned. A `bug` the owner files comes through the Bug template, untagged, and is engineering's to take in its queue order.
 
 ## The report to the owner, and its footer (both roles)
 

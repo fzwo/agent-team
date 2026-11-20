@@ -745,7 +745,7 @@ fi
 
 if run cleanup; then echo "cleanup"
   mkdir -p "$work/pc/bin" "$work/pc/origin.git" "$work/pc/junk"
-  printf '#!/bin/bash\ncase "$*" in *"--json state"*) echo MERGED ;; *headRefName*) echo feature ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"; chmod +x "$work/pc/bin/gh"
+  printf '#!/bin/bash\ncase "$*" in *"--jq if .merged"*) echo MERGED ;; *"--jq .head.ref") echo feature ;; "pr "*|"issue "*|"repo "*) echo "stub gh: GraphQL" >&2; exit 1 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"; chmod +x "$work/pc/bin/gh"
   ( cd "$work/pc" && git init -q --bare origin.git && git clone -q origin.git repo 2>/dev/null && cd repo \
     && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m init && git branch -M main && git push -q origin main 2>/dev/null \
     && git checkout -q -b feature && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m f && git push -q origin feature 2>/dev/null \
@@ -766,6 +766,19 @@ if run cleanup; then echo "cleanup"
   printf '%s' "$out" | grep -q "not found: /no/such/dir/Applications" && ok "missing parent is not found" || bad "missing parent mishandled"
   printf '%s' "$out" | grep -Eq "refusing(: | the repo).*pc/repo$" && ok "repo root refused" || bad "repo root not refused"
   out=$(cd "$work/pc/repo" && PATH="$work/pc/bin:$PATH" bash "$here/scripts/pr-cleanup.sh" 8 --worktree . 2>&1); check "main checkout as worktree refused" $? 1
+  # The one deletion gate: an open PR, answered as JSON through the script's own filter, removes nothing (review 65, round 3).
+  ( cd "$work/pc/repo" && git checkout -q -b feature2 && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m g && git push -q origin feature2 2>/dev/null && git checkout -q main )
+  cat > "$work/pc/bin/gh" <<'GH'
+#!/bin/bash
+case "$*" in
+  "api repos/{owner}/{repo}/pulls/"*" --jq "*) printf '%s' '{"merged":false,"state":"open","head":{"ref":"feature2"},"body":"","merged_at":null}' | jq -r "${@: -1}" ;;
+  "pr "*|"issue "*|"repo "*) echo "stub gh: GraphQL" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+GH
+  out=$(cd "$work/pc/repo" && PATH="$work/pc/bin:$PATH" bash "$here/scripts/pr-cleanup.sh" 15 2>&1); rc=$?
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "PR #15 is OPEN, not MERGED. Nothing removed" && git -C "$work/pc/repo" show-ref --verify --quiet refs/heads/feature2 && ok "cleanup: an open PR removes nothing, read through the real filter" || bad "open PR gate: rc=$rc $out"
+  printf '#!/bin/bash\ncase "$*" in *"--jq if .merged"*) echo MERGED ;; *"--jq .head.ref") echo feature ;; "pr "*|"issue "*|"repo "*) echo "stub gh: GraphQL" >&2; exit 1 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"   # the simple MERGED stub again for the tests below
   # Depth refusals: nothing this close to the root or directly under HOME, even when it exists.
   mkdir -p "$work/fakehome/Library" "$work/fakehome/deeper/x"; touch "$work/fakehome/Library/keep" "$work/fakehome/deeper/x/go"
   out=$(cd "$work/pc/repo" && HOME="$work/fakehome" PATH="$work/pc/bin:$PATH" bash "$here/scripts/pr-cleanup.sh" 9 --also "$work/fakehome/Library" --also "$work/fakehome/deeper/x/go" 2>&1)
@@ -773,7 +786,7 @@ if run cleanup; then echo "cleanup"
   [ -e "$work/fakehome/deeper/x/go" ] && bad "a deep exact path was kept" || ok "a deep exact path is removed"
   # A failed local removal stops before the remote branch and exits 1.
   ( cd "$work/pc/repo" && git checkout -q -b feature3 && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m h && git push -q origin feature3 2>/dev/null && git checkout -q main && git worktree add -q ../wt3 feature3 2>/dev/null && git worktree lock ../wt3 )
-  printf '#!/bin/bash\ncase "$*" in *"--json state"*) echo MERGED ;; *headRefName*) echo feature3 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"
+  printf '#!/bin/bash\ncase "$*" in *"--jq if .merged"*) echo MERGED ;; *"--jq .head.ref") echo feature3 ;; "pr "*|"issue "*|"repo "*) echo "stub gh: GraphQL" >&2; exit 1 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"
   out=$(cd "$work/pc/repo" && PATH="$work/pc/bin:$PATH" bash "$here/scripts/pr-cleanup.sh" 10 --worktree ../wt3 2>&1); rc=$?
   check "locked worktree: exit 1" $rc 1
   git -C "$work/pc/repo" ls-remote --exit-code --heads origin feature3 >/dev/null 2>&1 && ok "remote branch kept after a failed local cleanup" || bad "remote branch deleted despite failure"
@@ -791,7 +804,7 @@ if run cleanup; then echo "cleanup"
   # A worktree directory with regex characters is still recognised (the branch name is ordinary).
   ( cd "$work/pc/repo" && git checkout -q -b feature4 && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m i && git push -q origin feature4 2>/dev/null && git checkout -q main && git worktree add -q "../wt[4]" feature4 2>/dev/null )
   [ -d "$work/pc/wt[4]" ] || bad "test setup: bracketed worktree not created"
-  printf '#!/bin/bash\ncase "$*" in *"--json state"*) echo MERGED ;; *headRefName*) echo feature4 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"
+  printf '#!/bin/bash\ncase "$*" in *"--jq if .merged"*) echo MERGED ;; *"--jq .head.ref") echo feature4 ;; "pr "*|"issue "*|"repo "*) echo "stub gh: GraphQL" >&2; exit 1 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"
   out=$(cd "$work/pc/repo" && PATH="$work/pc/bin:$PATH" bash "$here/scripts/pr-cleanup.sh" 11 --worktree "../wt[4]" 2>&1); rc=$?
   check "worktree path with brackets: exit 0" $rc 0
   [ -d "$work/pc/wt[4]" ] && bad "bracketed worktree kept" || ok "bracketed worktree removed"
@@ -800,23 +813,16 @@ if run cleanup; then echo "cleanup"
   cat > "$work/pc/bin/gh" <<GH
 #!/bin/bash
 case "\$*" in
-  *"--json state"*"pr view"*|"pr view"*"--json state"*) echo MERGED ;;
-  *headRefName*) echo feature6 ;;
-  *"--json body"*) printf 'Tier: low\\nCloses #735 and fixes #12; see #99\\nResolves fzwo/project#736, closes: https://github.com/fzwo/project/issues/737, fixes other/repo#9\\ndisclosed #3, prefixes #4, unfixed #5\\nFixes #738 (closed by the owner last week)\\n' ;;
-  *"--json mergedAt"*) echo 2026-11-06T20:00:00Z ;;
-  "issue view 738 --json labels"*) printf 'decision\\n' ;;
-  "issue view 738 --json state"*) echo CLOSED ;;
-  "issue view 738 --json closedAt"*) echo 2026-11-01T09:00:00Z ;;
-  *"--json closedAt"*) echo 2026-11-06T20:00:04Z ;;
-  "issue view 3 --json labels"*|"issue view 4 --json labels"*|"issue view 5 --json labels"*) printf 'decision\\n' ;;
-  "issue view 3 --json state"*|"issue view 4 --json state"*|"issue view 5 --json state"*) echo CLOSED ;;
-  "repo view"*) echo fzwo/project ;;
-  "issue view 735 --json labels"*|"issue view 736 --json labels"*|"issue view 737 --json labels"*) printf 'decision\\n' ;;
-  "issue view 735 --json state"*|"issue view 736 --json state"*|"issue view 737 --json state"*) echo CLOSED ;;
-  "issue view 9 "*) echo "another repo's issue was looked up" >> "$work/pc/reopened"; exit 1 ;;
-  "issue view 12 --json labels"*) printf 'bug\\n' ;;
-  "issue view 12 --json state"*) echo CLOSED ;;
-  "issue reopen"*) echo "\$*" >> "$work/pc/reopened"; exit 0 ;;
+  "api repos/{owner}/{repo}/pulls/13 --jq "*) printf '%s' '{"merged":true,"state":"closed","head":{"ref":"feature6"},"merged_at":"2026-11-06T20:00:00Z","body":"Tier: low\\nCloses #735 and fixes #12; see #99\\nResolves fzwo/project#736, closes: https://github.com/fzwo/project/issues/737, fixes other/repo#9\\ndisclosed #3, prefixes #4, unfixed #5\\nFixes #738 (closed by the owner last week)\\n"}' | jq -r "\${@: -1}" ;;
+  "api repos/{owner}/{repo} --jq "*) printf '%s' '{"full_name":"fzwo/project"}' | jq -r "\${@: -1}" ;;
+  "api repos/{owner}/{repo}/issues/9 --jq "*) echo "another repo's issue was looked up" >> "$work/pc/reopened"; exit 1 ;;
+  "api repos/{owner}/{repo}/issues/738 --jq "*) printf '%s' '{"state":"closed","closed_at":"2026-11-01T09:00:00Z","labels":[{"name":"decision"}]}' | jq -r "\${@: -1}" ;;
+  "api repos/{owner}/{repo}/issues/12 --jq "*) printf '%s' '{"state":"closed","closed_at":"2026-11-06T20:00:04Z","labels":[{"name":"bug"}]}' | jq -r "\${@: -1}" ;;
+  "api repos/{owner}/{repo}/issues/"*" --jq "*) printf '%s' '{"state":"closed","closed_at":"2026-11-06T20:00:04Z","labels":[{"name":"decision"}]}' | jq -r "\${@: -1}" ;;
+  "api -X PATCH repos/{owner}/{repo}/issues/"*" -f state=open") n=\$(printf '%s' "\$4" | sed 's|.*/issues/||'); echo "issue reopen \$n (REST)" >> "$work/pc/reopened"; exit 0 ;;
+  "api -X PATCH repos/{owner}/{repo}/issues/"*) echo "stub gh: a PATCH that does not reopen: \$*" >&2; exit 1 ;;
+  "api -X POST repos/{owner}/{repo}/issues/"*"/comments "*) echo "comment: \$*" >> "$work/pc/comments"; exit 0 ;;
+  "pr "*|"issue "*|"repo "*) echo "stub gh: GraphQL" >&2; exit 1 ;;
   *) exit 0 ;;
 esac
 GH
@@ -829,21 +835,54 @@ GH
   grep -q "another repo" "$work/pc/reopened" && bad "another repo's issue number was looked up" || ok "another repo's issue is never touched"
   grep -q "^issue reopen 738 " "$work/pc/reopened" && bad "a decision closed before the merge was reopened" || ok "a decision the owner closed earlier stays closed"
   printf '%s' "$out" | grep -q "reopened #735" && ok "the reopen is reported" || bad "reopen not reported: $out"
+  grep -q "^comment: api -X POST repos/{owner}/{repo}/issues/735/comments -f body=Reopened by pr-cleanup: PR #13 closed this" "$work/pc/comments" 2>/dev/null && ok "the reopened issue gets the note as a comment (REST, 0.4.42)" || bad "no reopen comment: $(cat "$work/pc/comments" 2>/dev/null)"
   grep -q "^issue reopen 3 \|^issue reopen 4 \|^issue reopen 5 " "$work/pc/reopened" && bad "a word ending in a keyword (disclosed, unfixed) counted as closing" || ok "a word that merely ends in a keyword does not count"
   # gh failing on an issue: a warning, the number skipped, the script goes on.
   ( cd "$work/pc/repo" && git checkout -q -b feature7 && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m l && git push -q origin feature7 2>/dev/null && git checkout -q main )
-  printf '#!/bin/bash\ncase "$*" in *"--json state"*) echo MERGED ;; *headRefName*) echo feature7 ;; *"--json body"*) echo "Closes #800" ;; "repo view"*) echo fzwo/project ;; "issue view"*) exit 1 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"
+  printf '#!/bin/bash\ncase "$*" in *"--jq if .merged"*) echo MERGED ;; *"--jq .head.ref") echo feature7 ;; *"--jq .body"*) echo "Closes #800" ;; *"--jq .full_name") echo fzwo/project ;; *"/issues/"*) exit 1 ;; "pr "*|"issue "*|"repo "*) echo "stub gh: GraphQL" >&2; exit 1 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"
   out=$(cd "$work/pc/repo" && PATH="$work/pc/bin:$PATH" bash "$here/scripts/pr-cleanup.sh" 14 2>&1); rc=$?
   check "an unreadable issue does not stop the cleanup" $rc 0
   printf '%s' "$out" | grep -q "warning: could not read issue #800" && ok "an unreadable issue is warned about" || bad "no warning for an unreadable issue: $out"
   # A registered worktree whose directory is already gone is pruned, and the branch still goes.
   ( cd "$work/pc/repo" && git checkout -q -b feature5 && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m j && git push -q origin feature5 2>/dev/null && git checkout -q main && git worktree add -q ../wt5 feature5 2>/dev/null && rm -rf ../wt5 )
-  printf '#!/bin/bash\ncase "$*" in *"--json state"*) echo MERGED ;; *headRefName*) echo feature5 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"
+  printf '#!/bin/bash\ncase "$*" in *"--jq if .merged"*) echo MERGED ;; *"--jq .head.ref") echo feature5 ;; "pr "*|"issue "*|"repo "*) echo "stub gh: GraphQL" >&2; exit 1 ;; *) exit 0 ;; esac\n' > "$work/pc/bin/gh"
   out=$(cd "$work/pc/repo" && PATH="$work/pc/bin:$PATH" bash "$here/scripts/pr-cleanup.sh" 12 --worktree ../wt5 2>&1); rc=$?
   check "vanished worktree directory: exit 0" $rc 0
   git -C "$work/pc/repo" show-ref --verify --quiet refs/heads/feature5 && bad "branch of the vanished worktree kept" || ok "branch of the vanished worktree deleted"
 fi
 
+if run cleanup; then
+  # gh-labels.sh: REST only; an existing label (422 on create) is updated, --repo sets GH_REPO for the placeholders.
+  mkdir -p "$work/gl/bin"; cat > "$work/gl/bin/gh" <<'GH'
+#!/bin/bash
+echo "GH_REPO=${GH_REPO:-} $*" >> "$LOG"
+case "$*" in
+  "api -X POST repos/{owner}/{repo}/labels -f name=owner "*) echo '{"message":"Validation Failed","errors":[{"code":"already_exists"}]}' >&2; exit 1 ;;
+  "api -X POST repos/{owner}/{repo}/labels "*) echo '{}' ;;
+  "api -X PATCH repos/{owner}/{repo}/labels/owner "*) echo '{}' ;;
+  *) echo "stub gh: $*" >&2; exit 1 ;;
+esac
+GH
+  chmod +x "$work/gl/bin/gh"
+  out=$(cd "$work/pc/repo" && LOG="$work/gl/log" PATH="$work/gl/bin:$PATH" bash "$here/scripts/gh-labels.sh" --repo x/y 2>&1); rc=$?
+  check "labels: exit 0 with one label already present" $rc 0
+  [ "$(grep -c "api -X POST repos/{owner}/{repo}/labels -f name=" "$work/gl/log")" = 6 ] && ok "labels: six creates by REST (0.4.42)" || bad "labels: creates: $(grep -c POST "$work/gl/log")"
+  grep -q "api -X PATCH repos/{owner}/{repo}/labels/owner -f color=d93f0b -f description=" "$work/gl/log" && ok "labels: an existing label is updated by PATCH" || bad "labels: no PATCH for the existing label"
+  grep -q "^GH_REPO=x/y api" "$work/gl/log" && ok "labels: --repo becomes GH_REPO for the placeholders" || bad "labels: GH_REPO not set"
+  grep -q "^GH_REPO= " "$work/gl/log" && bad "labels: a call without GH_REPO" || ok "labels: every call carries GH_REPO"
+  grep -q "stub gh:" <<<"$out" && bad "labels: a non-REST call: $out" || ok "labels: no gh label call"
+  cat > "$work/gl/bin/gh" <<'GH'
+#!/bin/bash
+case "$*" in
+  "api -X POST repos/{owner}/{repo}/labels -f name=idea "*) echo "HTTP 403: Resource not accessible" >&2; exit 1 ;;
+  "api -X POST repos/{owner}/{repo}/labels "*) echo '{}' ;;
+  "api -X PATCH repos/{owner}/{repo}/labels/idea "*) echo "HTTP 404: Not Found" >&2; exit 1 ;;
+  *) echo "stub gh: $*" >&2; exit 1 ;;
+esac
+GH
+  out=$(cd "$work/pc/repo" && PATH="$work/gl/bin:$PATH" bash "$here/scripts/gh-labels.sh" 2>&1); rc=$?
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "gh-labels: creating idea failed: HTTP 403" && printf '%s' "$out" | grep -q "HTTP 404" && ok "labels: a label that can be neither created nor updated fails with both messages (review 65, round 3)" || bad "labels failure path: rc=$rc $out"
+fi
 if run changelog; then echo "changelog"
   mkdir -p "$work/cl" && ( cd "$work/cl" && git init -q )
   f=$(cd "$work/cl" && "$here/scripts/changelog-new.sh" engineering "Overnight Line! v2" --issue 570 --pr 582)
@@ -1217,18 +1256,26 @@ if run merge; then echo "merge"
 #!/bin/bash
 d="$STUB"; echo "$*" >> "$d/calls"
 case "$*" in
-  "pr view "*"--json state"*) if [ -f "$d/state-reads" ]; then r=$(( $(cat "$d/state-reads") + 1 )); echo $r > "$d/state-reads"; [ -f "$d/merged-visible-at" ] && [ "$r" -lt "$(cat "$d/merged-visible-at")" ] && { echo OPEN; exit 0; }; fi; cat "$d/state" ;;
-  "pr list --head feature --state open"*) echo 7 ;;
-  "pr list --head twice --state open"*) printf '7\n8\n' ;;
-  "pr list --head broken --state open"*) echo "HTTP 401: Bad credentials" >&2; exit 1 ;;
-  "pr list --head "*) : ;;
-  "pr view "*"--json baseRefName"*) echo main ;;
-  "pr view "*"--json headRefName"*) echo feature ;;
-  "pr view "*"--json mergeable"*) n=$(cat "$d/polls" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$d/polls"
-    [ "$n" = 1 ] && [ -f "$d/on-first-poll" ] && . "$d/on-first-poll"   # the world moves while the script waits
-    [ -f "$d/err-at" ] && [ "$n" = "$(cat "$d/err-at")" ] && { echo "HTTP 502 Bad Gateway" >&2; exit 1; }
-    if [ -f "$d/flip-at" ] && [ "$n" -ge "$(cat "$d/flip-at")" ]; then echo MERGEABLE; else cat "$d/mergeable"; fi ;;
-  "pr merge "*) if [ -f "$d/merge-fails" ]; then echo "GraphQL: Pull Request is not mergeable" >&2; exit 1; fi; echo "$*" > "$d/merge-call"; echo MERGED > "$d/state"; echo 0 > "$d/state-reads"; echo merged ;;
+  # REST forms only (0.4.42): the script's calls are `gh api repos/{owner}/{repo}/pulls/<n> --jq <filter>`; a `gh pr` call is a
+  # failure. The stub holds the PR as JSON and runs the script's own filter through jq, so the mappings (merged and state to
+  # MERGED/OPEN/CLOSED, mergeable true/false/null to MERGEABLE/CONFLICTING/UNKNOWN) are what the tests exercise (review 65).
+  "api repos/{owner}/{repo}/pulls?state=open"*) f="${@: -1}"; case "${PR_BRANCH:-}" in broken) echo "HTTP 401: Bad credentials" >&2; exit 1 ;; esac; jq -r "$f" "$d/pulls.json" ;;
+  "api repos/{owner}/{repo}/pulls/"*)
+    f="${@: -1}"; st=$(cat "$d/state"); mg=$(cat "$d/mergeable" 2>/dev/null || echo UNKNOWN)
+    case "$f" in
+      *.merged*)
+        if [ -f "$d/state-reads" ]; then r=$(( $(cat "$d/state-reads") + 1 )); echo $r > "$d/state-reads"; [ -f "$d/merged-visible-at" ] && [ "$r" -lt "$(cat "$d/merged-visible-at")" ] && st=OPEN; fi ;;
+      *.mergeable*)
+        n=$(cat "$d/polls" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$d/polls"
+        [ "$n" = 1 ] && [ -f "$d/on-first-poll" ] && . "$d/on-first-poll"   # the world moves while the script waits
+        [ -f "$d/err-at" ] && [ "$n" = "$(cat "$d/err-at")" ] && { echo "HTTP 502 Bad Gateway" >&2; exit 1; }
+        [ -f "$d/flip-at" ] && [ "$n" -ge "$(cat "$d/flip-at")" ] && mg=MERGEABLE ;;
+    esac
+    case "$st" in MERGED) merged=true; state=closed ;; CLOSED) merged=false; state=closed ;; *) merged=false; state=open ;; esac
+    case "$mg" in MERGEABLE) mable=true ;; CONFLICTING) mable=false ;; *) mable=null ;; esac
+    printf '{"merged":%s,"state":"%s","mergeable":%s,"base":{"ref":"main"},"head":{"ref":"feature"}}' "$merged" "$state" "$mable" | jq -r "$f" ;;
+  "api -X PUT repos/{owner}/{repo}/pulls/"*"/merge "*) if [ -f "$d/merge-fails" ]; then echo "HTTP 405: Pull Request is not mergeable" >&2; exit 1; fi; echo "$*" > "$d/merge-call"; echo MERGED > "$d/state"; echo 0 > "$d/state-reads"; echo '{"merged":true}' ;;
+  "pr "*|"issue "*|"repo "*|"label "*) echo "stub gh: GraphQL is not available here: $*" >&2; exit 1 ;;
   *) echo "stub gh: $*" >&2; exit 1 ;;
 esac
 GH
@@ -1249,10 +1296,17 @@ AWK
   git init -q --bare "$mg/origin.git" && git -C "$mg/origin.git" symbolic-ref HEAD refs/heads/main
   gitm clone -q "$mg/origin.git" "$mg/co" 2>/dev/null; ( cd "$mg/co" && gitm commit -q --allow-empty -m base1 && gitm push -q origin HEAD:main && gitm checkout -q -b feature && gitm commit -q --allow-empty -m f1 && gitm push -q origin feature && gitm checkout -q main )
   gitm clone -q "$mg/origin.git" "$mg/other" 2>/dev/null   # another agent's clone: its pushes are not in co's origin/* until fetched
-  reset_stub() { rm -f "$mg/stub/"*; echo OPEN > "$mg/stub/state"; echo MERGEABLE > "$mg/stub/mergeable"; }
+  cat > "$mg/pulls.json" <<'JSON'
+[{"number":7,"head":{"ref":"feature","repo":{"full_name":"x/y","fork":false}},"base":{"repo":{"full_name":"x/y"}}},
+ {"number":8,"head":{"ref":"feature","repo":null},"base":{"repo":{"full_name":"x/y"}}},
+ {"number":9,"head":{"ref":"twice","repo":{"full_name":"x/y","fork":false}},"base":{"repo":{"full_name":"x/y"}}},
+ {"number":10,"head":{"ref":"twice","repo":{"full_name":"x/y","fork":false}},"base":{"repo":{"full_name":"x/y"}}},
+ {"number":11,"head":{"ref":"forked","repo":{"full_name":"z/y","fork":true}},"base":{"repo":{"full_name":"x/y"}}}]
+JSON
+  reset_stub() { rm -f "$mg/stub/"*; echo OPEN > "$mg/stub/state"; echo MERGEABLE > "$mg/stub/mergeable"; cp "$mg/pulls.json" "$mg/stub/pulls.json"; }
   pm() { ( cd "$mg/co" && STUB="$mg/stub" PR_MERGE_POLL=0 PATH="$mg/bin:$PATH" bash "$here/scripts/pr-merge.sh" "$@" ); }
   reset_stub; echo MERGED > "$mg/stub/state"; pm 7 >/dev/null 2>&1; check "merge: a PR that is not OPEN is refused, exit 1" $? 1
-  reset_stub; echo CLOSED > "$mg/stub/state"; out=$(pm 7 2>&1); printf '%s' "$out" | grep -q "is CLOSED, not OPEN" && ! grep -q "pr merge" "$mg/stub/calls" && ok "merge: a closed PR: the message says so and nothing is merged" || bad "closed PR: $out"
+  reset_stub; echo CLOSED > "$mg/stub/state"; out=$(pm 7 2>&1); printf '%s' "$out" | grep -q "is CLOSED, not OPEN" && ! grep -q "pulls/7/merge" "$mg/stub/calls" && ok "merge: a closed PR: the message says so and nothing is merged" || bad "closed PR: $out"
   # main moves past the branch by a document only: the merge goes on and says so (a shift was refused six times for state-file commits).
   ( cd "$mg/other" && gitm pull -q --ff-only origin main && mkdir -p .agent-team design && echo s > .agent-team/state.md && echo d > design/DESIGN.md && echo n > NOTES.md && gitm add -A && gitm commit -q -m docs && gitm push -q origin HEAD:main )
   reset_stub; out=$(pm 7 --dry-run 2>&1); rc=$?
@@ -1269,7 +1323,7 @@ AWK
   # main moves past the branch by code: refused with the instruction; no merge call.
   ( cd "$mg/other" && mkdir -p src && echo c > src/a.swift && gitm add -A && gitm commit -q -m base2 && gitm push -q origin HEAD:main )
   reset_stub; out=$(pm 7 2>&1); rc=$?
-  [ $rc = 1 ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s) that #7 (feature) does not, touching code (src/a.swift). Merge main into feature, rerun the build and the tests the PR touches" && ! grep -q "pr merge" "$mg/stub/calls" && ok "merge: main moved past the branch: refused with the instruction, nothing merged" || bad "main moved: rc=$rc $out"
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s) that #7 (feature) does not, touching code (src/a.swift). Merge main into feature, rerun the build and the tests the PR touches" && ! grep -q "pulls/7/merge" "$mg/stub/calls" && ok "merge: main moved past the branch: refused with the instruction, nothing merged" || bad "main moved: rc=$rc $out"
   reset_stub; out=$(pm 7 --dry-run --unaffected src 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "touching documents and --unaffected paths only (src/a.swift); going on" && ok "merge: a code commit under an --unaffected path does not block (0.4.37)" || bad "unaffected path: rc=$rc $out"
   reset_stub; out=$(pm 7 --dry-run --unaffected src/ --strict 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "refusing under --strict: .*touching documents and --unaffected paths only" && ok "merge: --strict refuses an --unaffected code commit too" || bad "strict with unaffected: rc=$rc $out"
   reset_stub; out=$(pm 7 --dry-run --unaffected ./src/ 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "going on" && ok "merge: --unaffected takes ./src/ as src" || bad "normalised path: rc=$rc $out"
@@ -1280,9 +1334,13 @@ AWK
   pm 7 --unaffected / >/dev/null 2>&1; check "merge: --unaffected / is a usage error" $? 2
   pm 7 --unaffected . >/dev/null 2>&1; check "merge: --unaffected . is a usage error" $? 2
   pm 7 --unaffected ../x >/dev/null 2>&1; check "merge: --unaffected ../x is a usage error" $? 2
+  reset_stub; pm 7 --dry-run >/dev/null 2>&1; grep -q "^pr \|^issue \|^repo " "$mg/stub/calls" && bad "merge: a gh pr/issue/repo call was made (GraphQL, refused in a cloud session)" || ok "merge: every gh call is a REST api call (0.4.42)"
   reset_stub; out=$(pm feature --dry-run --unaffected src --unaffected srcx --unaffected app/src 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "^pr-merge.sh: branch feature is #7" && printf '%s' "$out" | grep -q "dry run: #7 (feature into main" && ok "merge: a branch name resolves to its open PR (0.4.39)" || bad "branch name: rc=$rc $out"
   reset_stub; out=$(pm nosuch --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "no open PR has the head branch 'nosuch'" && ! grep -q "pr view" "$mg/stub/calls" && ok "merge: a branch with no open PR is refused before any PR read" || bad "unknown branch: rc=$rc $out"
-  reset_stub; out=$(pm twice --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "more than one open PR has the head branch 'twice' (7 8); give the number" && ok "merge: an ambiguous branch is refused with the numbers" || bad "ambiguous branch: rc=$rc $out"
+  reset_stub; out=$(pm twice --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "more than one open PR has the head branch 'twice' (9 10); give the number" && ok "merge: an ambiguous branch is refused with the numbers" || bad "ambiguous branch: rc=$rc $out"
+  reset_stub; out=$(pm 'nosuch" or .number == 7 or "' --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "no open PR has the head branch" && ! printf '%s' "$out" | grep -q "is #7" && ok "merge: a branch name shaped like jq cannot select another PR (review 65, round 3)" || bad "jq injection: rc=$rc $out"
+  reset_stub; out=$(pm forked --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "no open PR has the head branch 'forked'" && ok "merge: a fork's PR on the branch is not this repository's (review 65)" || bad "fork PR: rc=$rc $out"
+  reset_stub; out=$(pm feature --dry-run 2>&1); printf '%s' "$out" | grep -q "branch feature is #7" && ! printf '%s' "$out" | grep -q "more than one" && ok "merge: a deleted fork's PR on the same branch does not make it ambiguous" || bad "deleted fork: $out"
   pm 7 feature >/dev/null 2>&1; check "merge: a number and a branch together are a usage error" $? 2
   reset_stub; out=$(pm broken --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "HTTP 401: Bad credentials" && printf '%s' "$out" | grep -q "cannot list the open PRs for branch 'broken'" && ! printf '%s' "$out" | grep -q "no open PR" && ok "merge: a gh failure on the branch lookup shows gh's message and is not read as no PR (review 62)" || bad "gh failure on branch: rc=$rc $out"
   # the PR itself touches src/: src cannot be --unaffected (review 60, round 3)
@@ -1292,12 +1350,12 @@ AWK
   # the branch takes main in: the check passes
   ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
   reset_stub; echo CONFLICTING > "$mg/stub/mergeable"; out=$(pm 7 2>&1); rc=$?
-  [ $rc = 1 ] && printf '%s' "$out" | grep -q "CONFLICTING" && ! grep -q "pr merge" "$mg/stub/calls" && ok "merge: CONFLICTING is refused, nothing merged" || bad "conflicting: rc=$rc $out"
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "CONFLICTING" && ! grep -q "pulls/7/merge" "$mg/stub/calls" && ok "merge: CONFLICTING is refused, nothing merged" || bad "conflicting: rc=$rc $out"
   reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; out=$(pm 7 --wait-mergeable 2 2>&1); rc=$?   # 2 s: with a 1 s wait a second boundary once let a single poll through
-  [ $rc = 1 ] && printf '%s' "$out" | grep -q "still UNKNOWN after 2s" && printf '%s' "$out" | grep -q "never merge on UNKNOWN" && ! grep -q "pr merge" "$mg/stub/calls" && [ "$(cat "$mg/stub/polls")" -ge 2 ] && ok "merge: UNKNOWN that stays is refused after the wait, polled, nothing merged" || bad "unknown: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) $out"
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "still UNKNOWN after 2s" && printf '%s' "$out" | grep -q "never merge on UNKNOWN" && ! grep -q "pulls/7/merge" "$mg/stub/calls" && [ "$(cat "$mg/stub/polls")" -ge 2 ] && ok "merge: UNKNOWN that stays is refused after the wait, polled, nothing merged" || bad "unknown: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) $out"
   reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; echo 3 > "$mg/stub/flip-at"; out=$(pm 7 --wait-mergeable 30 2>&1); rc=$?
   hs=$(git -C "$mg/co" rev-parse origin/feature)
-  [ $rc = 0 ] && [ "$(cat "$mg/stub/polls")" -ge 3 ] && [ "$(cat "$mg/stub/merge-call")" = "pr merge 7 --merge --match-head-commit $hs" ] && printf '%s' "$out" | grep -q "merged #7 (feature into main, merge), shown MERGED" && printf '%s' "$out" | grep -q "Next: pr-cleanup.sh 7" && ok "merge: UNKNOWN that turns MERGEABLE is merged once it does, naming the head commit checked, MERGED confirmed, next steps printed" || bad "flip: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) call=$(cat "$mg/stub/merge-call" 2>/dev/null) $out"
+  [ $rc = 0 ] && [ "$(cat "$mg/stub/polls")" -ge 3 ] && [ "$(cat "$mg/stub/merge-call")" = "api -X PUT repos/{owner}/{repo}/pulls/7/merge -f merge_method=merge -f sha=$hs" ] && printf '%s' "$out" | grep -q "merged #7 (feature into main, merge), shown MERGED" && printf '%s' "$out" | grep -q "Next: pr-cleanup.sh 7" && ok "merge: UNKNOWN that turns MERGEABLE is merged once it does, naming the head commit checked, MERGED confirmed, next steps printed" || bad "flip: rc=$rc polls=$(cat "$mg/stub/polls" 2>/dev/null) call=$(cat "$mg/stub/merge-call" 2>/dev/null) $out"
   # The base moves while the script waits for mergeability: the check after the wait refuses; nothing merged.
   ( cd "$mg/other" && gitm pull -q --ff-only origin main )
   reset_stub; echo UNKNOWN > "$mg/stub/mergeable"; echo 2 > "$mg/stub/flip-at"; printf 'cd %s && echo 3 >> src/a.swift && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -am base3 && git push -q origin HEAD:main\n' "$mg/other" > "$mg/stub/on-first-poll"
@@ -1311,7 +1369,7 @@ AWK
   reset_stub; echo 3 > "$mg/stub/merged-visible-at"; out=$(pm 7 2>&1); rc=$?
   [ $rc = 0 ] && [ "$(cat "$mg/stub/state-reads")" -ge 3 ] && printf '%s' "$out" | grep -q "shown MERGED" && ok "merge: MERGED is polled for, not assumed" || bad "merged poll: rc=$rc reads=$(cat "$mg/stub/state-reads" 2>/dev/null) $out"
   reset_stub; out=$(pm 7 --method squash 2>&1); rc=$?
-  [ $rc = 0 ] && grep -q -- "^pr merge 7 --squash --match-head-commit" "$mg/stub/merge-call" && printf '%s' "$out" | grep -q "(feature into main, squash)" && ok "merge: --method squash is passed through" || bad "squash: rc=$rc $(cat "$mg/stub/merge-call" 2>/dev/null) $out"
+  [ $rc = 0 ] && grep -q -- "^api -X PUT repos/{owner}/{repo}/pulls/7/merge -f merge_method=squash -f sha=" "$mg/stub/merge-call" && printf '%s' "$out" | grep -q "(feature into main, squash)" && ok "merge: --method squash is passed through" || bad "squash: rc=$rc $(cat "$mg/stub/merge-call" 2>/dev/null) $out"
   pm 7 --method fast >/dev/null 2>&1; check "merge: an unknown --method is a usage error, exit 2" $? 2
   # The dry run runs the check after the wait too: the base moves during the wait, the dry run refuses like the real run.
   ( cd "$mg/other" && gitm pull -q --ff-only origin main )
@@ -1330,7 +1388,7 @@ AWK
   printf '%s' "$out" | grep -q "touching code (src/a.swift" && ok "merge: the refusal names the code file main moved by" || bad "refusal names no code file: $out"
   ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
   reset_stub; : > "$mg/stub/merge-fails"; out=$(pm 7 2>&1); rc=$?
-  [ $rc = 1 ] && printf '%s' "$out" | grep -q "gh pr merge refused #7; nothing was merged. Do not close the issue" && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: a refused gh pr merge exits 1 and says not to close the issue" || bad "merge refused: rc=$rc $out"
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "GitHub refused the merge of #7; nothing was merged. Do not close the issue" && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: a refused gh pr merge exits 1 and says not to close the issue" || bad "merge refused: rc=$rc $out"
   reset_stub; out=$(pm x 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "no open PR has the head branch 'x'" && ok "merge: a word that is no PR number is read as a branch and refused when no open PR has it (0.4.39; was a usage error)" || bad "non-numeric: rc=$rc $out"
   out=$(pm 7 8 2>&1); rc=$?; [ $rc = 2 ] && printf '%s' "$out" | grep -q "one PR, not two (7 and 8)" && ok "merge: two PR numbers are a usage error, exit 2, that names both" || bad "two numbers: rc=$rc $out"
   pm --dry-run >/dev/null 2>&1; check "merge: no PR number is a usage error, exit 2" $? 2

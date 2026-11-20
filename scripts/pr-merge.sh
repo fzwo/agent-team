@@ -3,6 +3,8 @@
 #   pr-merge.sh <pr-number|branch> [--wait-mergeable 90] [--method merge|squash|rebase] [--dry-run] [--strict] [--unaffected <path>]...
 # A branch name in place of the number is resolved to this repository's open PR for it (refused when there is none or
 # more than one; a fork's PR does not count). A branch named like a number, or starting with -, needs the number.
+# Every GitHub call is `gh api` on the REST endpoints: `gh pr` and `gh issue` go through GraphQL, which a cloud
+# session's gh cannot reach (HTTP 403, 2026-11), so a shift there merged by hand without this script's checks.
 # Refuses (exit 1) when the PR is not OPEN; when the base branch has commits the PR's head does not (two PRs each
 # reviewed clean against an older main once broke main for an hour: one added an exhaustive switch, the other an
 # enum case; merge the base into the branch, rerun the build and the tests the PR touches, push, run this again),
@@ -15,8 +17,8 @@
 # when GitHub reports CONFLICTING; and when mergeability is still UNKNOWN after --wait-mergeable seconds (GitHub
 # computes it lazily after a push; never merge on UNKNOWN; an error from gh counts as unknown until then). The base
 # check runs again after the wait, since the base can move during it, and the merge names the head commit it
-# checked, so a head pushed meanwhile is refused by GitHub. Then merges with `gh pr merge` (--method, default
-# merge; a repository that allows only squash says so in its convention), waits until GitHub shows MERGED (exit 1
+# checked, so a head pushed meanwhile is refused by GitHub. Then merges through the REST merge endpoint (--method,
+# default merge; a repository that allows only squash says so in its convention), waits until GitHub shows MERGED (exit 1
 # if it does not within a minute: check before any cleanup), and prints the next steps. Nothing else is touched:
 # closing the issue comes after MERGED, by hand or by the cleanup. Run it from the project checkout; it fetches
 # the base and the head from origin into refs of its own (refs/pr-merge/<pr>/, removed when it exits), so the
@@ -26,7 +28,7 @@
 # removed on exit): run it from your shift's checkout, not a shared one. PR_MERGE_POLL (seconds between checks,
 # default 5) is for the tests.
 set -eu
-usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
 # The PR number and the options in any order (`--dry-run 1141` and `1141 --dry-run` both work; the first form was a usage error once).
 pr=""; wait_m=90; method=merge; dry=""; strict=""; noted=""; unaff=""
 while [ $# -gt 0 ]; do
@@ -47,7 +49,11 @@ done
 case "$pr" in *[!0-9]*)   # a branch name: its one open PR (a shift pasted a branch and got the usage line)
   # A gh failure (no GitHub remote, a bad token, a 5xx) is not "no PR": gh's own message stays visible and the script
   # stops; a fork's PR with the same branch name is not this repository's (isCrossRepository).
-  nums=$(gh pr list --head "$pr" --state open --json number,isCrossRepository -q '.[] | select(.isCrossRepository | not) | .number') || { echo "pr-merge.sh: cannot list the open PRs for branch '$pr'; see gh's message above" >&2; exit 1; }
+  # This repository's own PRs: the head's repository is the base's (`.head.repo.fork` says whether that repository is
+  # itself a fork, which a project forked from elsewhere always is; a deleted fork's head.repo is null).
+  # The name reaches jq through the environment, not as program text: interpolated, a name holding `" or .number == 7 or "`
+  # would have selected another PR (gh's jq resolves `env.NAME`).
+  nums=$(PR_BRANCH="$pr" gh api "repos/{owner}/{repo}/pulls?state=open&per_page=100" --paginate --jq '.[] | select(.head.ref == env.PR_BRANCH and .head.repo != null and .head.repo.full_name == .base.repo.full_name) | .number') || { echo "pr-merge.sh: cannot list the open PRs for branch '$pr'; see gh's message above" >&2; exit 1; }
   case "$(printf '%s\n' "$nums" | grep -c .)" in
     0) echo "pr-merge.sh: no open PR has the head branch '$pr'" >&2; exit 1 ;;
     1) echo "pr-merge.sh: branch $pr is #$nums"; pr="$nums" ;;
@@ -55,9 +61,11 @@ case "$pr" in *[!0-9]*)   # a branch name: its one open PR (a shift pasted a bra
   esac ;;
 esac
 poll="${PR_MERGE_POLL:-5}"
-state=$(gh pr view "$pr" --json state -q .state) || { echo "pr-merge.sh: cannot read #$pr" >&2; exit 1; }
+# The PR's state as `gh pr view` named it: MERGED, OPEN or CLOSED.
+pr_state() { gh api "repos/{owner}/{repo}/pulls/$1" --jq 'if .merged then "MERGED" else (.state | ascii_upcase) end'; }
+state=$(pr_state "$pr") || { echo "pr-merge.sh: cannot read #$pr" >&2; exit 1; }
 [ "$state" = OPEN ] || { echo "pr-merge.sh: #$pr is ${state:-unreadable}, not OPEN; nothing to merge" >&2; exit 1; }
-base=$(gh pr view "$pr" --json baseRefName -q .baseRefName) || base=""; head=$(gh pr view "$pr" --json headRefName -q .headRefName) || head=""
+base=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq .base.ref) || base=""; head=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq .head.ref) || head=""
 [ -n "$base" ] && [ -n "$head" ] || { echo "pr-merge.sh: cannot read the branches of #$pr" >&2; exit 1; }
 # The two tips, fetched into refs of this script's own, named for the PR and removed on exit: what the comparison
 # sees is what origin has now, and a run for another PR in the same repository does not mix with this one.
@@ -102,7 +110,8 @@ refresh() {
 refresh
 deadline=$(( $(date +%s) + wait_m ))
 while :; do
-  m=$(gh pr view "$pr" --json mergeable -q .mergeable 2>/dev/null) || m=""
+  # REST's mergeable is true, false or null while GitHub computes it: the three states gh pr view named.
+  m=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq 'if .mergeable == true then "MERGEABLE" elif .mergeable == false then "CONFLICTING" else "UNKNOWN" end' 2>/dev/null) || m=""
   case "$m" in
     MERGEABLE) break ;;
     CONFLICTING) echo "pr-merge.sh: refusing: GitHub reports #$pr CONFLICTING. Merge $base into $head and resolve, rebuild, push; the fix gets its review round." >&2; exit 1 ;;
@@ -112,12 +121,13 @@ done
 refresh   # the base may have moved while we waited: the shift's case was two merges minutes apart
 head_sha=$(git rev-parse "$rh")
 if [ -n "$dry" ]; then echo "dry run: #$pr ($head into $base, $method) would merge at $head_sha if the head is unchanged by then; every check passed, nothing merged."; exit 0; fi
-gh pr merge "$pr" "--$method" --match-head-commit "$head_sha" || { echo "pr-merge.sh: gh pr merge refused #$pr; nothing was merged. Do not close the issue; read the message above (a head pushed since the check, a merge method the repository does not allow, a conflict)." >&2; exit 1; }
+# `sha` is the head the checks saw: GitHub refuses the merge when the branch moved since (gh pr merge's --match-head-commit).
+gh api -X PUT "repos/{owner}/{repo}/pulls/$pr/merge" -f merge_method="$method" -f sha="$head_sha" >/dev/null || { echo "pr-merge.sh: GitHub refused the merge of #$pr; nothing was merged. Do not close the issue; read the message above (a head pushed since the check, a merge method the repository does not allow, a conflict)." >&2; exit 1; }
 deadline=$(( $(date +%s) + 60 ))
 while :; do
-  state=$(gh pr view "$pr" --json state -q .state 2>/dev/null) || state=""
+  state=$(pr_state "$pr" 2>/dev/null) || state=""
   [ "$state" = MERGED ] && break
-  if [ "$(date +%s)" -ge "$deadline" ]; then echo "pr-merge.sh: #$pr is not shown MERGED yet (${state:-unreadable}). Check 'gh pr view $pr --json state' before any cleanup or issue change." >&2; exit 1; fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then echo "pr-merge.sh: #$pr is not shown MERGED yet (${state:-unreadable}). Check the PR's state (gh api repos/{owner}/{repo}/pulls/$pr --jq .merged) before any cleanup or issue change." >&2; exit 1; fi
   sleep "$poll"
 done
 echo "merged #$pr ($head into $base, $method), shown MERGED."

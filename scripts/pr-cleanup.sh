@@ -7,6 +7,8 @@
 # checkout, if present, is run with the worktree's absolute path as its only argument, so a
 # project can remove what it keeps per checkout outside the worktree (build folders in
 # $TMPDIR, caches named for the path), by exact name. A failing hook warns; git cleanup goes on.
+# GitHub is read and written through `gh api` on the REST endpoints only: `gh pr` and `gh issue` need GraphQL,
+# which a cloud session's gh cannot reach (HTTP 403, 2026-11).
 set -eu
 pr="${1:-}"; shift || true
 [ -n "$pr" ] || { echo "usage: pr-cleanup.sh <pr-number> [--worktree PATH] [--also PATH]..." >&2; exit 1; }
@@ -22,8 +24,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-state=$(gh pr view "$pr" --json state -q .state)
-branch=$(gh pr view "$pr" --json headRefName -q .headRefName)
+state=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq 'if .merged then "MERGED" else (.state | ascii_upcase) end')
+branch=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq .head.ref)
 if [ "$state" != "MERGED" ]; then
   echo "pr-cleanup: PR #$pr is $state, not MERGED. Nothing removed." >&2
   exit 1
@@ -32,27 +34,28 @@ echo "PR #$pr is MERGED (branch $branch)"
 
 # "Closes #N" in a PR body closes N on merge, and a `decision` or `owner` issue is the owner's to close:
 # reopen it with a note. (PR bodies say "see #N" for those; this is the net under that rule.)
-body=$(gh pr view "$pr" --json body -q .body 2>/dev/null || true)
-merged_at=$(gh pr view "$pr" --json mergedAt -q .mergedAt 2>/dev/null || true)
-this_repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
+body=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq '.body // ""' 2>/dev/null || true)
+merged_at=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq '.merged_at // ""' 2>/dev/null || true)
+this_repo=$(gh api "repos/{owner}/{repo}" --jq .full_name 2>/dev/null || true)
 # The forms GitHub honours: "#N", "owner/repo#N" and the issue's URL, each after a closing keyword with an
 # optional colon; only this repo's issues (a number from another repo is never touched).
 refs=$(printf '%s' "$body" | tr '\n' ' ' | grep -Eio "\b(close[sd]?|fix(e[sd])?|resolve[sd]?):?[[:space:]]*(#|${this_repo:-/}#|https://github\.com/${this_repo:-/}/issues/)[0-9]+" || true)
 for n in $(printf '%s' "$refs" | grep -Eo '[0-9]+$' | sort -u); do
   # gh alone in the substitution: a pipe would hide its failure behind tr's status.
-  labels=$(gh issue view "$n" --json labels -q '.labels[].name' 2>/dev/null) || { echo "warning: could not read issue #$n to see whether the merge closed a decision" >&2; continue; }
+  labels=$(gh api "repos/{owner}/{repo}/issues/$n" --jq '.labels[].name' 2>/dev/null) || { echo "warning: could not read issue #$n to see whether the merge closed a decision" >&2; continue; }
   labels=$(printf '%s\n' "$labels" | tr '\n' ' ')
-  st=$(gh issue view "$n" --json state -q .state 2>/dev/null || true)
+  st=$(gh api "repos/{owner}/{repo}/issues/$n" --jq '.state | ascii_upcase' 2>/dev/null || true)
   # Only an issue this merge closed: one the owner closed earlier, and a later PR merely mentions, stays closed.
   # Timestamps are ISO-8601 in UTC, so they compare as strings; GitHub closes the issue at or after the merge.
-  closed_at=$(gh issue view "$n" --json closedAt -q .closedAt 2>/dev/null || true)
+  closed_at=$(gh api "repos/{owner}/{repo}/issues/$n" --jq '.closed_at // ""' 2>/dev/null || true)
   if [ -n "$merged_at" ] && [ -n "$closed_at" ] && [ "$closed_at" \< "$merged_at" ]; then continue; fi
   case " $labels " in
     *" decision "*|*" owner "*)
       if [ "$st" = CLOSED ]; then
         kind=$(printf '%s' "$labels" | grep -Eo 'decision|owner' | head -1)
-        if gh issue reopen "$n" --comment "Reopened by pr-cleanup: PR #$pr closed this through a closing keyword, and a \`$kind\` issue is the owner's to close. PR bodies say \"see #$n\" for these."; then
+        if gh api -X PATCH "repos/{owner}/{repo}/issues/$n" -f state=open >/dev/null; then
           echo "reopened #$n: a $kind issue closed by the merge"
+          gh api -X POST "repos/{owner}/{repo}/issues/$n/comments" -f body="Reopened by pr-cleanup: PR #$pr closed this through a closing keyword, and a \`$kind\` issue is the owner's to close. PR bodies say \"see #$n\" for these." >/dev/null || echo "warning: reopened #$n but could not comment on it" >&2
         else
           echo "warning: could not reopen #$n, a $kind issue the merge closed" >&2
         fi

@@ -18,7 +18,10 @@ jobs:
           cutoff=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
           gh issue list --repo "$REPO" --label decision --state open --json number,updatedAt --limit 200 \
             --jq ".[] | select(.updatedAt < \"$cutoff\") | .number" | while read -r n; do
-            reopened=$(gh api "repos/$REPO/issues/$n/events" --paginate --slurp --jq '[.[][] | select(.event == "reopened")] | length')
+            # gh refuses --slurp together with --jq (gh 2.x, 2026-11; a project's setup PR spent four review rounds on this line): take the
+            # paginated --jq output first, skip the issue when the call fails (never close on an unread history), then count.
+            events=$(gh api "repos/$REPO/issues/$n/events" --paginate --jq '.[] | select(.event == "reopened") | .id') || { echo "skipping #$n: could not read its events"; continue; }
+            reopened=$(printf '%s\n' "$events" | grep -c . || true)
             if [ "${reopened:-0}" -gt 0 ]; then echo "skipping #$n: it was reopened, so it is the owner's"; continue; fi
             gh issue close "$n" --repo "$REPO" --comment "Accepted by silence: no comment for 7 days, per the team process. To overrule, comment (and reopen); a reopen alone is not seen by the agents."
             echo "closed #$n"

@@ -29,6 +29,8 @@ A re-review round **resumes the reviewer that did the previous round** (the Agen
 
 ```
 gh pr list --state merged --search "Tier: standard" --limit 500 --json number -q "[.[] | select(.number > ${LAST:-0})] | length"
+# in a cloud session (gh pr is refused there), the REST form:
+gh api "repos/{owner}/{repo}/pulls?state=closed&per_page=100" --paginate --jq "[.[] | select(.merged_at != null and ((.body // \"\") | test(\"Tier: standard\")) and .number > ${LAST:-0})] | length"
 ```
 
 (`--limit 500` because the default returns 30; `$LAST` is the last audited PR number from the state file, `0` before the first audit; an empty value counts as 0.) The query reads PR bodies, so the body's `Tier:` line is the source of truth: whoever applies an owner's tier change from a comment also edits that line in the body. Two blocking audit findings among the last ten audits switch standard tier back to fresh reviewers for every round; the switch is written in the same section with the date, and the owner lifts it.

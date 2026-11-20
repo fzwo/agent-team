@@ -40,6 +40,7 @@ A cloud session is the fallback (the Mac is busy, or ad hoc work). It cannot rea
 - Verify by observation: the rendered page, the HTTP response read back, the row in the database, the log line. A green test is not evidence on its own.
 - Anything racy (queues, retries, concurrent requests) runs five to ten times.
 - A negative result needs a control that shows the positive case in the same run.
+- Every test and build command in a builder brief runs without prompts (`--noinput` for Django's test runner, the equivalent for others), so a prompt fails fast instead of waiting for an answer nobody gives: a test run once sat ten minutes on "delete the test database?" behind another builder's run.
 
 ## High-risk tier
 
