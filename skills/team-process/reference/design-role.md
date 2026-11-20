@@ -18,7 +18,7 @@ You check the build. If your session can run it (a Claude Code session on the Ma
 - `TOKENS.md`: colours, type, spacing, wording rules. Tokens win over boards; fix the board.
 - `design/boards/`, `design/components/`, `design/mockups/`, your half of `design/changelog/` (format in `changelog.md`).
 
-The owner owns `ROADMAP.md`; you may draft changes to it in an `idea` issue after a product conversation, and the owner orders it.
+The owner owns `ROADMAP.md`'s order and content; its bookkeeping is both agents' as housekeeping, and an owner's decision made in a product conversation with you goes into it by your housekeeping PR, quoted with the date, at the place the owner names (the team-process skill's "Who owns which files"). A proposal of your own is an `idea` issue, and the owner orders it.
 
 ## What you decide alone and what you ask
 
