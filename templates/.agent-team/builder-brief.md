@@ -4,7 +4,7 @@ Lock names: `sim:<device>` for a simulator, `device:<udid>`, `ui` for the screen
 Report: `<session scratch>/<your name>/handback.md` (not `report.md`: the harness refuses that name from a subagent), written before the hand-back; evidence and logs beside it, never a bare file in the shared scratch directory.
 Synthetic input: hold `ui` and check the target app is frontmost before any key or click; keys go to the front window.
 Disk floor: <20 GB on an Apple machine, 10 GB otherwise>; stop and say so before a build would break it.
-Build folders: <where builds go, which are shared, what to never delete>
+Build folders: <where builds go, which are shared and so need `build:<target>`, which commands need no lock (a package test in a worktree), what to never delete>
 Attribution: <the commit trailer and PR footer the project uses>
 Screenshots and recordings: <the content rule: what may appear in an image, which fixtures to use; from CLAUDE.md>
 Simulator recipe: <device, appearance, text size, status bar; the commands>
