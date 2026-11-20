@@ -1218,6 +1218,10 @@ if run merge; then echo "merge"
 d="$STUB"; echo "$*" >> "$d/calls"
 case "$*" in
   "pr view "*"--json state"*) if [ -f "$d/state-reads" ]; then r=$(( $(cat "$d/state-reads") + 1 )); echo $r > "$d/state-reads"; [ -f "$d/merged-visible-at" ] && [ "$r" -lt "$(cat "$d/merged-visible-at")" ] && { echo OPEN; exit 0; }; fi; cat "$d/state" ;;
+  "pr list --head feature --state open"*) echo 7 ;;
+  "pr list --head twice --state open"*) printf '7\n8\n' ;;
+  "pr list --head broken --state open"*) echo "HTTP 401: Bad credentials" >&2; exit 1 ;;
+  "pr list --head "*) : ;;
   "pr view "*"--json baseRefName"*) echo main ;;
   "pr view "*"--json headRefName"*) echo feature ;;
   "pr view "*"--json mergeable"*) n=$(cat "$d/polls" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$d/polls"
@@ -1276,6 +1280,11 @@ AWK
   pm 7 --unaffected / >/dev/null 2>&1; check "merge: --unaffected / is a usage error" $? 2
   pm 7 --unaffected . >/dev/null 2>&1; check "merge: --unaffected . is a usage error" $? 2
   pm 7 --unaffected ../x >/dev/null 2>&1; check "merge: --unaffected ../x is a usage error" $? 2
+  reset_stub; out=$(pm feature --dry-run --unaffected src --unaffected srcx --unaffected app/src 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "^pr-merge.sh: branch feature is #7" && printf '%s' "$out" | grep -q "dry run: #7 (feature into main" && ok "merge: a branch name resolves to its open PR (0.4.39)" || bad "branch name: rc=$rc $out"
+  reset_stub; out=$(pm nosuch --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "no open PR has the head branch 'nosuch'" && ! grep -q "pr view" "$mg/stub/calls" && ok "merge: a branch with no open PR is refused before any PR read" || bad "unknown branch: rc=$rc $out"
+  reset_stub; out=$(pm twice --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "more than one open PR has the head branch 'twice' (7 8); give the number" && ok "merge: an ambiguous branch is refused with the numbers" || bad "ambiguous branch: rc=$rc $out"
+  pm 7 feature >/dev/null 2>&1; check "merge: a number and a branch together are a usage error" $? 2
+  reset_stub; out=$(pm broken --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "HTTP 401: Bad credentials" && printf '%s' "$out" | grep -q "cannot list the open PRs for branch 'broken'" && ! printf '%s' "$out" | grep -q "no open PR" && ok "merge: a gh failure on the branch lookup shows gh's message and is not read as no PR (review 62)" || bad "gh failure on branch: rc=$rc $out"
   # the PR itself touches src/: src cannot be --unaffected (review 60, round 3)
   ( cd "$mg/co" && gitm checkout -q feature && mkdir -p src && echo f > src/f.swift && gitm add -A && gitm commit -q -m ownsrc && gitm push -q origin feature && gitm checkout -q main )
   reset_stub; out=$(pm 7 --dry-run --unaffected src --unaffected srcx --unaffected app/src 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "refusing: --unaffected names a path #7 (feature) itself changes (src/f.swift)" && ok "merge: a path the PR itself changes cannot be --unaffected" || bad "own path: rc=$rc $out"
@@ -1322,8 +1331,8 @@ AWK
   ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
   reset_stub; : > "$mg/stub/merge-fails"; out=$(pm 7 2>&1); rc=$?
   [ $rc = 1 ] && printf '%s' "$out" | grep -q "gh pr merge refused #7; nothing was merged. Do not close the issue" && [ "$(cat "$mg/stub/state")" = OPEN ] && ok "merge: a refused gh pr merge exits 1 and says not to close the issue" || bad "merge refused: rc=$rc $out"
-  pm x >/dev/null 2>&1; check "merge: a non-numeric PR is a usage error, exit 2" $? 2
-  out=$(pm 7 8 2>&1); rc=$?; [ $rc = 2 ] && printf '%s' "$out" | grep -q "one PR number, not two (7 and 8)" && ok "merge: two PR numbers are a usage error, exit 2, that names both" || bad "two numbers: rc=$rc $out"
+  reset_stub; out=$(pm x 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "no open PR has the head branch 'x'" && ok "merge: a word that is no PR number is read as a branch and refused when no open PR has it (0.4.39; was a usage error)" || bad "non-numeric: rc=$rc $out"
+  out=$(pm 7 8 2>&1); rc=$?; [ $rc = 2 ] && printf '%s' "$out" | grep -q "one PR, not two (7 and 8)" && ok "merge: two PR numbers are a usage error, exit 2, that names both" || bad "two numbers: rc=$rc $out"
   pm --dry-run >/dev/null 2>&1; check "merge: no PR number is a usage error, exit 2" $? 2
   reset_stub; out=$(pm --dry-run 7 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "dry run: #7" && ok "merge: the options may come before the PR number" || bad "options first: rc=$rc $out"
   pm 7 --bogus >/dev/null 2>&1; check "merge: an unknown option is a usage error, exit 2" $? 2

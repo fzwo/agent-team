@@ -1,6 +1,8 @@
 #!/bin/bash
 # Merge a PR only when it is safe to: GitHub knows it is mergeable, and the branch holds the base it lands on.
-#   pr-merge.sh <pr-number> [--wait-mergeable 90] [--method merge|squash|rebase] [--dry-run] [--strict] [--unaffected <path>]...
+#   pr-merge.sh <pr-number|branch> [--wait-mergeable 90] [--method merge|squash|rebase] [--dry-run] [--strict] [--unaffected <path>]...
+# A branch name in place of the number is resolved to this repository's open PR for it (refused when there is none or
+# more than one; a fork's PR does not count). A branch named like a number, or starting with -, needs the number.
 # Refuses (exit 1) when the PR is not OPEN; when the base branch has commits the PR's head does not (two PRs each
 # reviewed clean against an older main once broke main for an hour: one added an exhaustive switch, the other an
 # enum case; merge the base into the branch, rerun the build and the tests the PR touches, push, run this again),
@@ -24,7 +26,7 @@
 # removed on exit): run it from your shift's checkout, not a shared one. PR_MERGE_POLL (seconds between checks,
 # default 5) is for the tests.
 set -eu
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; }
 # The PR number and the options in any order (`--dry-run 1141` and `1141 --dry-run` both work; the first form was a usage error once).
 pr=""; wait_m=90; method=merge; dry=""; strict=""; noted=""; unaff=""
 while [ $# -gt 0 ]; do
@@ -38,11 +40,20 @@ while [ $# -gt 0 ]; do
 "; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
-    *) case "$1" in *[!0-9]*) echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run] [--strict] [--unaffected <path>]..." >&2; exit 2 ;; esac
-       [ -z "$pr" ] || { echo "pr-merge.sh: one PR number, not two ($pr and $1)" >&2; exit 2; }; pr="$1"; shift ;;
+    *) [ -z "$pr" ] || { echo "pr-merge.sh: one PR, not two ($pr and $1)" >&2; exit 2; }; pr="$1"; shift ;;
   esac
 done
-[ -n "$pr" ] || { echo "usage: pr-merge.sh <pr-number> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run] [--strict] [--unaffected <path>]..." >&2; exit 2; }
+[ -n "$pr" ] || { echo "usage: pr-merge.sh <pr-number|branch> [--wait-mergeable SECONDS] [--method merge|squash|rebase] [--dry-run] [--strict] [--unaffected <path>]..." >&2; exit 2; }
+case "$pr" in *[!0-9]*)   # a branch name: its one open PR (a shift pasted a branch and got the usage line)
+  # A gh failure (no GitHub remote, a bad token, a 5xx) is not "no PR": gh's own message stays visible and the script
+  # stops; a fork's PR with the same branch name is not this repository's (isCrossRepository).
+  nums=$(gh pr list --head "$pr" --state open --json number,isCrossRepository -q '.[] | select(.isCrossRepository | not) | .number') || { echo "pr-merge.sh: cannot list the open PRs for branch '$pr'; see gh's message above" >&2; exit 1; }
+  case "$(printf '%s\n' "$nums" | grep -c .)" in
+    0) echo "pr-merge.sh: no open PR has the head branch '$pr'" >&2; exit 1 ;;
+    1) echo "pr-merge.sh: branch $pr is #$nums"; pr="$nums" ;;
+    *) echo "pr-merge.sh: more than one open PR has the head branch '$pr' ($(printf '%s\n' "$nums" | tr '\n' ' ' | sed 's/ $//')); give the number" >&2; exit 1 ;;
+  esac ;;
+esac
 poll="${PR_MERGE_POLL:-5}"
 state=$(gh pr view "$pr" --json state -q .state) || { echo "pr-merge.sh: cannot read #$pr" >&2; exit 1; }
 [ "$state" = OPEN ] || { echo "pr-merge.sh: #$pr is ${state:-unreadable}, not OPEN; nothing to merge" >&2; exit 1; }

@@ -33,6 +33,10 @@ gh pr list --state merged --search "Tier: standard" --limit 500 --json number -q
 
 A round is clean when it reports no finding that needs a code change. Notes (comments, naming, style) do not block a merge and are never fixed in the same PR, because every fix costs another round: record them in the PR, merge, and collect the shift's notes into one PR at the end of the shift, reviewed as low tier. A note that hides a bug is a finding, not a note.
 
+## What a fix round may change
+
+A review round's fixes address the findings, and nothing else. New behaviour that a finding or a note suggests goes into its own issue or PR, or a `decision`, never into the PR under review: on a high-tier PR a shift answered round-1 notes by adding behaviour (waiting out a call between episodes), rounds 2 and 3 each found bugs in exactly that addition, and the tripwire fired until the addition was removed. The maintainer's own round 60 did the same (a newline join added in a fix round) and got away with it under review; the rule holds all the same, since the reviewer's attention in a fix round is on the findings.
+
 ## The tripwire
 
 There is no cap on rounds. Technical findings, fixed and re-reviewed, are the system working. Escalate to a `decision` issue, with the history of rounds, when:
