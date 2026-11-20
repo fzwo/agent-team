@@ -24,7 +24,11 @@ listed when it appears or carries R's label; the other role's PRs only when
 labelled for R; an item R itself bumped last is not listed again, nor one R
 routed to the other role (R's comment newest in the tick, the other role's label on
 it, not R's; a label edit a tick later than the comment is listed, since the comment
-is behind the cursor by then). Agent comments on
+is behind the cursor by then), nor an echo of R's own actions: an issue closed within
+three minutes of R's merged PR that named it or of R's own newest comment, or an issue
+seen before whose state, title and body are as last seen and that gained no for-R label
+(a label, assignee or milestone edit without a comment); the state file watch-R.last
+holds each issue's state, a hash of its text and its labels as last seen. Agent comments on
 issues labelled `idea` are skipped; the owner's are not. An owner's `decision`
 issue addressed to no role wakes on its opening and its comments, not its edits. Inline review comments
 on PR diffs are included. The cursor and the seen ids live in the state
@@ -53,6 +57,7 @@ row, look at the state directory), 2 = stop and tell the owner.
 """
 import argparse, glob, json, os, re, subprocess, sys, time
 from datetime import datetime, timezone, timedelta
+import hashlib
 
 TAGS = {"engineering": "[engineering]", "design": "[design]"}
 
@@ -163,6 +168,7 @@ def main():
     seen_file = os.path.join(a.state_dir, f"watch-{a.role}.seen")
     summary_file = os.path.join(a.state_dir, f"watch-{a.role}.summary")
     ideas_file = os.path.join(a.state_dir, f"watch-{a.role}.ideas")   # idea issue numbers seen so far
+    last_file = os.path.join(a.state_dir, f"watch-{a.role}.last")     # per known issue: its state and labels last seen
     my_tag = TAGS[a.role]
 
     if os.path.exists(cursor_file):
@@ -177,6 +183,12 @@ def main():
     ideas = set()
     if os.path.exists(ideas_file):
         ideas = {int(x) for x in open(ideas_file).read().split() if x.isdigit()}
+    last = {}   # issue id -> "state titlebodyhash labels" as last seen (labels last: a label may hold spaces), so a bare label edit by this role is not input
+    if os.path.exists(last_file):
+        for line in open(last_file).read().splitlines():
+            parts = line.split(" ", 1)
+            if parts[0].isdigit():
+                last[int(parts[0])] = parts[1] if len(parts) > 1 else ""
 
     started = time.time()
     # Idle time survives restarts (--max-minutes restarts often): kept in the state dir.
@@ -220,6 +232,21 @@ def main():
             number = c["issue_url"].rsplit("/", 1)[-1]
             if number.isdigit() and c["updated_at"] >= own_bumped.get(int(number), ("", False))[0]:
                 own_bumped[int(number)] = (c["updated_at"], first_line_tag(c.get("body")) == my_tag)
+        # Issues this role's own merged PRs closed through a closing keyword: number -> the merge time. Both agents
+        # work under the owner's account, so the close itself looks like the owner's; the PR's tag says whose it was.
+        my_merges = {}
+        for i in issues:
+            merged_at = (i.get("pull_request") or {}).get("merged_at")
+            if merged_at and first_line_tag(i.get("body")) == my_tag:
+                # The forms GitHub honours, as pr-cleanup.sh reads them: #N, owner/repo#N and the issue's URL.
+                for m in re.finditer(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s*(?:#|[\w.-]+/[\w.-]+#|https://github\.com/[\w.-]+/[\w.-]+/issues/)(\d+)", i.get("body") or ""):
+                    my_merges[int(m.group(1))] = merged_at
+        def within(later, earlier, seconds=180):   # ISO-8601 Z timestamps, the same shape as GitHub writes them
+            try:
+                lt = datetime.strptime(later, "%Y-%m-%dT%H:%M:%SZ"); et = datetime.strptime(earlier, "%Y-%m-%dT%H:%M:%SZ")
+            except (TypeError, ValueError):
+                return False
+            return 0 <= (lt - et).total_seconds() <= seconds
         for i in issues:
             newest = max(newest, i["updated_at"])
             key = f"issue:{i['id']}:{i['updated_at']}"
@@ -261,6 +288,28 @@ def main():
             other = [r for r in TAGS if r != a.role][0]
             if (known or i.get("created_at", "") < since) and ob and ob[1] and f"for-{other}" in labels.split(",") and f"for-{a.role}" not in labels.split(","):
                 continue
+            # Echoes of this role's own actions (most wakes of a busy cloud shift were these): an issue closed within
+            # three minutes of this role's merged PR that named it, or of this role's own newest comment (the session
+            # closed it with that comment; three minutes covers a close made in the same turn as the comment and is
+            # short enough that the owner's close later in the hour still wakes); and an issue seen before whose state,
+            # title and body are as last seen and that gained no label for this role (a label, assignee or milestone
+            # edit without a comment: the session labelled it). The owner's own close, relabel for this role, edit or
+            # comment still wakes: each changes the state or the text, adds for-<role>, or arrives through the comments.
+            closed_at = i.get("closed_at") or ""
+            text_hash = hashlib.sha1(((i.get("title") or "") + "\n" + (i.get("body") or "")).encode()).hexdigest()[:12]
+            now_seen = f"{i['state']} {text_hash} {labels}"
+            if kind == "issue" and i["state"] == "closed" and closed_at:
+                if within(closed_at, my_merges.get(i["number"], "")):
+                    last[i["id"]] = now_seen; continue
+                if ob and ob[1] and within(closed_at, ob[0]):
+                    last[i["id"]] = now_seen; continue
+            prev = last.get(i["id"])
+            if kind == "issue" and prev is not None:
+                parts = prev.split(" ", 2) + ["", ""]
+                prev_state, prev_hash, prev_labels = parts[0], parts[1], parts[2]
+                if prev_state == i["state"] and prev_hash == text_hash and (f"for-{a.role}" not in labels.split(",") or f"for-{a.role}" in prev_labels.split(",")):
+                    last[i["id"]] = now_seen; continue
+            last[i["id"]] = now_seen
             items.append(f"- #{i['number']} {kind} by {who(i.get('body'))}, {i['state']}, labels: {labels or '-'}: {i['title']}")
         for c in comments:
             newest = max(newest, c["updated_at"])
@@ -286,6 +335,7 @@ def main():
             open(cursor_file, "w").write(since)
             open(seen_file, "w").write("\n".join(sorted(seen)))
             open(ideas_file, "w").write("\n".join(str(n) for n in sorted(ideas)))
+            open(last_file, "w").write("\n".join(f"{k} {v}" for k, v in sorted(last.items())))
         except OSError as e:
             print(f"watch-github: cannot write state in {a.state_dir}: {e}", file=sys.stderr)
             sys.exit(3)

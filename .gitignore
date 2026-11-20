@@ -6,3 +6,4 @@ __pycache__/
 .agent-team/watch-*.summary
 .agent-team/watch-*.active
 .agent-team/watch-*.ideas
+.agent-team/watch-*.last
