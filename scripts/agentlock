@@ -502,6 +502,16 @@ cmd_with() {
     esac
   done
   [ $# -gt 0 ] && [ -n "$WITH_RES" ] || die "usage: agentlock with <resource> [opts] -- <command...>"
+  # A command that starts with NAME=value words is run through env, as a shell would run it: `"$@"` alone took the
+  # assignment for the command name ("FOO=1: command not found"; a project's documented test command, 0.4.44). The
+  # check is syntactic and comes before any lock is taken: assignments alone run nothing, and a malformed line must
+  # not wait out a --wait behind a holder to say so (review 68). Through env the command must be a program, not a builtin.
+  local with_env=""
+  case "$1" in [A-Za-z_]*=*) if printf '%s' "$1" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*='; then
+    local w has_cmd=""; for w in "$@"; do printf '%s' "$w" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=' || { has_cmd=1; break; }; done
+    [ -n "$has_cmd" ] || die "usage: agentlock with <resource> [opts] -- [NAME=value ...] <program...> (assignments alone run nothing; through env the command must be a program)"
+    with_env=1
+  fi ;; esac
   if cmd_check "$WITH_RES" 2>/dev/null; then WITH_OWNED=1; fi   # already ours: leave it as it is, do not release it afterwards
   if [ -n "$WITH_OWNED" ]; then
     # A resource taken before someone else's quiet began gives no right to run under the measurement (a quiet waits
@@ -515,6 +525,7 @@ cmd_with() {
     cmd_acquire ${args[@]+"${args[@]}"} --quiet || return 1
     trap 'cmd_release "$WITH_RES" >/dev/null' EXIT INT TERM
   fi
+  [ -z "$with_env" ] || set -- env "$@"
   "$@"
 }
 
@@ -532,7 +543,18 @@ cmd_wait() {
     if [ "$deadline" -gt 0 ] && [ "$(now)" -ge "$deadline" ]; then echo "still held: $(describe "$holder")" >&2; return 1; fi
     poll_sleep
   done
-  echo "$1 is free"
+  # The holder's own wait is "free" for it, and for quiet that is worth a word: the hook still blocks the holder's plain
+  # commands (it cannot tell the measurer's from a sibling's), so only `with quiet -- <command>` runs (a builder read
+  # "free" and then saw its build blocked, 0.4.40).
+  if [ "$1" = quiet ] && [ -d "$dir" ] && held_by_me "$dir" && ! is_stale "$dir"; then
+    # The hook runs as the session for every command, a builder's too, so a session's own quiet passes its own plain
+    # commands and its builders' alike (the hook passes their lock calls as well; the lock tool refuses those when they
+    # run), while a builder's quiet blocks every plain command of the session, the builder's own included.
+    if [ -n "${AGENTLOCK_AS:-}" ]; then echo "quiet is yours ($(describe "$dir")): the hook blocks plain commands under it, yours included; run the measurement as agentlock with quiet -- <command>"
+    else echo "quiet is yours ($(describe "$dir")): the hook passes your plain commands and your builders' alike; only their lock calls are refused, by the lock tool; launch no builder and run nothing of theirs while you hold it"; fi
+  else
+    echo "$1 is free"
+  fi
 }
 
 cmd_check() {
@@ -1064,7 +1086,7 @@ SEGL
         exit 2
       fi
       [ "$res" = heavy ] && continue
-      holds_family quiet && continue   # the machine is this owner's: every resource with it
+      holds_family quiet && continue   # the machine is this owner's: every resource with it (a quiet waits for every other lock and blocks new ones, so nobody else holds a simulator meanwhile; the same reason a `with quiet` grant covers every rule in granted())
       holds_family "$res" && continue
       # Granted only when every match of the rule lies inside the grant's span: the text before an acquire or a with,
       # and the text after a with's chain, are checked too.

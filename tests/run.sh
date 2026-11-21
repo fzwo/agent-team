@@ -261,6 +261,24 @@ if run lock; then echo "lock"
   AGENTLOCK_OWNER=A $L acquire q9 --ttl 1m >/dev/null
   out=$(AGENTLOCK_POLL=1 AGENTLOCK_OWNER=M $L acquire quiet --ttl 1m --wait 2s 2>&1); rc=$?; [ $rc = 1 ] && [ "$(printf '%s\n' "$out" | grep -c 'waiting for quiet: others hold: q9')" = 1 ] && ok "a measurer waiting for quiet is told once who holds what" || bad "quiet waiting line: rc=$rc $out"
   AGENTLOCK_OWNER=A $L release q9 >/dev/null
+  # `with` runs a command that starts with NAME=value words through env (0.4.45); the holder's own `wait quiet` says what free means for it.
+  out=$(AGENTLOCK_OWNER=W $L with sim:x --ttl 1m -- FOO=bar BAR=baz sh -c 'echo "$FOO-$BAR"' 2>&1); rc=$?; [ $rc = 0 ] && [ "$out" = "bar-baz" ] && ok "with: a leading NAME=value is an assignment, not the command (0.4.45)" || bad "with NAME=value: rc=$rc $out"
+  out=$(AGENTLOCK_OWNER=W $L with sim:x --ttl 1m -- sh -c 'echo plain' 2>&1); [ "$out" = "plain" ] && ok "with: a plain command still runs as itself" || bad "with plain: $out"
+  out=$(AGENTLOCK_OWNER=W $L with sim:x --ttl 1m -- ./no=such 2>&1); rc=$?; [ $rc != 0 ] && ! printf '%s' "$out" | grep -q "env: " && ok "with: a path holding = is not an assignment" || bad "with path=: rc=$rc $out"
+  out=$(AGENTLOCK_OWNER=W $L with sim:x --ttl 1m -- FOO=1 BAR=2 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "assignments alone run nothing" && ! printf '%s' "$out" | grep -q "^PATH=" && ok "with: assignments with no command are a usage error, not an env dump (review 68)" || bad "with assignments alone: rc=$rc $(printf '%s' "$out" | head -2)"
+  AGENTLOCK_OWNER=W $L status sim:x | grep -q "^sim:x: free" && ok "with: the usage error left no lock behind" || bad "with assignments alone left a lock: $(AGENTLOCK_OWNER=W $L status sim:x)"
+  AGENTLOCK_OWNER=H $L acquire sim:x --ttl 1m >/dev/null; t0=$(date +%s); out=$(AGENTLOCK_POLL=1 AGENTLOCK_OWNER=W $L with sim:x --wait 5s -- FOO=1 2>&1); rc=$?; t1=$(date +%s)
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "assignments alone run nothing" && ! printf '%s' "$out" | grep -q "waiting for" && [ $((t1 - t0)) -le 2 ] && ok "with: assignments alone are refused before any wait or acquire (review 68, final round)" || bad "with assignments alone behind a holder: rc=$rc after $((t1 - t0))s: $out"
+  AGENTLOCK_OWNER=H $L release sim:x >/dev/null
+  AGENTLOCK_OWNER=Q AGENTLOCK_AS=m $L acquire quiet --ttl 1m --reason measure >/dev/null
+  out=$(AGENTLOCK_OWNER=Q AGENTLOCK_AS=m $L wait quiet 1s 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "^quiet is yours (owner=Q:m .*blocks plain commands under it, yours included; run the measurement as agentlock with quiet -- <command>" && ok "a builder holding quiet is told its own plain commands are blocked (0.4.45)" || bad "holder's wait quiet: rc=$rc $out"
+  out=$(AGENTLOCK_OWNER=Q $L wait quiet 1s 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "still held: owner=Q:m" && ok "the session's own wait quiet is held while its builder holds quiet, as the hook has it" || bad "session's wait under its builder's quiet: rc=$rc $out"
+  AGENTLOCK_OWNER=Q AGENTLOCK_AS=m $L release quiet >/dev/null; AGENTLOCK_OWNER=Q $L acquire quiet --ttl 1m --reason measure >/dev/null
+  out=$(AGENTLOCK_OWNER=Q $L wait quiet 1s 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "^quiet is yours (owner=Q .*passes your plain commands and your builders' alike; only their lock calls are refused, by the lock tool" && ok "a session holding quiet itself is told the hook passes its own and its builders' plain commands (review 68)" || bad "session holder's wait quiet: rc=$rc $out"
+  AGENTLOCK_OWNER=Q $L release quiet >/dev/null; AGENTLOCK_OWNER=Q AGENTLOCK_AS=m $L acquire quiet --ttl 1m --reason measure >/dev/null
+  out=$(AGENTLOCK_POLL=1 AGENTLOCK_OWNER=Q AGENTLOCK_AS=b $L wait quiet 1s 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "still held: owner=Q:m" && ok "a sibling builder's wait quiet is held, as the hook has it" || bad "sibling's wait quiet: rc=$rc $out"
+  AGENTLOCK_OWNER=Q AGENTLOCK_AS=m $L release quiet >/dev/null
+  out=$(AGENTLOCK_OWNER=Q $L wait quiet 1s 2>&1); [ "$out" = "quiet is free" ] && ok "wait quiet with nothing held says free" || bad "free wait quiet: $out"
   # A re-acquire of an own lock refreshes but never shortens: with 1 h left, --ttl 1m leaves the expiry; --ttl 2h moves it out.
   AGENTLOCK_OWNER=A $L acquire ra --ttl 1h >/dev/null; e1=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
   out=$(AGENTLOCK_OWNER=A $L acquire ra --ttl 1m); rc=$?; e2=$(sed -n 's/^expires=//p' "$AGENTLOCK_DIR/locks/ra/info")
@@ -1266,7 +1284,9 @@ if run sweep; then echo "sweep"
   [ ! -f "$sw/_Users_me_x.lock" ] && [ ! -d "$sw/TemporaryDirectory.aaaaaa" ] && ok "sweep: Instruments does not gate the other classes" || bad "other classes gated by Instruments"
   # Without lsof the lock files cannot be told from open ones: they stay, and the report says why.
   rm -rf "$sw"; mkdir -p "$sw" "$work/sweep/nolsof"; plant
-  for t in bash ls find rm rmdir wc tr cat sed sort head mkdir pwd dirname basename touch kill mkfifo sleep; do p=$(command -v $t) && ln -sf "$p" "$work/sweep/nolsof/$t"; done
+  # The system's own binaries, not whatever sits first on PATH: a harness once put an rm wrapper there that could not find
+  # the real rm inside this minimal PATH, and the folders stayed (a cloud container, 2026-11-21).
+  for t in bash ls find rm rmdir wc tr cat sed sort head mkdir pwd dirname basename touch kill mkfifo sleep; do p=""; for d in /bin /usr/bin /usr/local/bin; do [ -x "$d/$t" ] && { p="$d/$t"; break; }; done; [ -n "$p" ] || p=$(command -v $t); [ -n "$p" ] && ln -sf "$p" "$work/sweep/nolsof/$t"; done
   out=$(PATH="$work/sweep/nolsof" bash "$here/scripts/tmp-sweep.sh" --delete "$sw" 2>&1); rc=$?
   check "sweep without lsof: exits 0" $rc 0
   [ -f "$sw/_Users_me_x.lock" ] && printf '%s' "$out" | grep -q "lsof not found: lock files are left alone" && ok "sweep without lsof: lock files stay and the report says why" || bad "without lsof: $out / $(ls -A "$sw")"
@@ -1338,13 +1358,14 @@ AWK
 JSON
   reset_stub() { rm -f "$mg/stub/"*; echo OPEN > "$mg/stub/state"; echo MERGEABLE > "$mg/stub/mergeable"; cp "$mg/pulls.json" "$mg/stub/pulls.json"; }
   pm() { ( cd "$mg/co" && STUB="$mg/stub" PR_MERGE_POLL=0 PATH="$mg/bin:$PATH" bash "$here/scripts/pr-merge.sh" "$@" ); }
-  reset_stub; echo MERGED > "$mg/stub/state"; pm 7 >/dev/null 2>&1; check "merge: a PR that is not OPEN is refused, exit 1" $? 1
+  reset_stub; echo MERGED > "$mg/stub/state"; out=$(pm 7 2>&1); rc=$?; check "merge: a PR that is not OPEN is refused, exit 1" $rc 1
+  [ "$(printf '%s\n' "$out" | tail -1)" = "pr-merge.sh: REFUSED #7; nothing merged." ] && ok "merge: the not-OPEN refusal ends on the REFUSED line too (review 68)" || bad "not-OPEN last line: $(printf '%s\n' "$out" | tail -1)"
   reset_stub; echo CLOSED > "$mg/stub/state"; out=$(pm 7 2>&1); printf '%s' "$out" | grep -q "is CLOSED, not OPEN" && ! grep -q "pulls/7/merge" "$mg/stub/calls" && ok "merge: a closed PR: the message says so and nothing is merged" || bad "closed PR: $out"
   # main moves past the branch by a document only: the merge goes on and says so (a shift was refused six times for state-file commits).
   ( cd "$mg/other" && gitm pull -q --ff-only origin main && mkdir -p .agent-team design && echo s > .agent-team/state.md && echo d > design/DESIGN.md && echo n > NOTES.md && gitm add -A && gitm commit -q -m docs && gitm push -q origin HEAD:main )
   reset_stub; out=$(pm 7 --dry-run 2>&1); rc=$?
   [ $rc = 0 ] && printf '%s' "$out" | grep -q "touching documents only (.agent-team/state.md NOTES.md design/DESIGN.md); going on" && ok "merge: a base that moved by documents only does not block, and the note lists them" || bad "docs-only behind: rc=$rc $out"
-  reset_stub; out=$(pm 7 --dry-run --strict 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "refusing under --strict: origin/main has 1 commit(s) that #7 (feature) does not, touching documents only (.agent-team/state.md NOTES.md design/DESIGN.md)" && ok "merge: --strict refuses a documents-only move, naming the documents" || bad "strict: rc=$rc $out"
+  reset_stub; out=$(pm 7 --dry-run --strict 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "refusing: under --strict: origin/main has 1 commit(s) that #7 (feature) does not, touching documents only (.agent-team/state.md NOTES.md design/DESIGN.md)" && ok "merge: --strict refuses a documents-only move, naming the documents" || bad "strict: rc=$rc $out"
   [ "$(printf '%s\n' "$(pm 7 --dry-run 2>&1)" | grep -c 'touching documents only')" = 1 ] && ok "merge: the documents-only note prints once, not again after the wait" || bad "note printed twice"
   ( cd "$mg/co" && gitm fetch -q origin && gitm checkout -q feature && gitm merge -q --no-edit origin/main && gitm push -q origin feature && gitm checkout -q main )
   # A code file moved into docs/ on main is a code change, not a document: refused (a rename would show under its new name only).
@@ -1356,12 +1377,14 @@ JSON
   # main moves past the branch by code: refused with the instruction; no merge call.
   ( cd "$mg/other" && mkdir -p src && echo c > src/a.swift && gitm add -A && gitm commit -q -m base2 && gitm push -q origin HEAD:main )
   reset_stub; out=$(pm 7 2>&1); rc=$?
-  [ $rc = 1 ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s) that #7 (feature) does not, touching code (src/a.swift). Merge main into feature, rerun the build and the tests the PR touches" && ! grep -q "pulls/7/merge" "$mg/stub/calls" && ok "merge: main moved past the branch: refused with the instruction, nothing merged" || bad "main moved: rc=$rc $out"
+  [ "$(printf '%s\n' "$out" | tail -1)" = "pr-merge.sh: REFUSED #7; nothing merged." ] && ok "merge: a refusal's last line says REFUSED (0.4.45)" || bad "refusal last line: $(printf '%s\n' "$out" | tail -1)"
+  printf '%s' "$out" | grep -q "targets: src)" && ok "merge: the refusal names the targets the code commits touch" || bad "targets missing: $out"
+  [ $rc = 1 ] && printf '%s' "$out" | grep -q "origin/main has 1 commit(s) that #7 (feature) does not, touching code (src/a.swift; targets: src). Merge main into feature, rebuild those targets and the PR's own, rerun the tests the PR touches" && ! grep -q "pulls/7/merge" "$mg/stub/calls" && ok "merge: main moved past the branch: refused with the instruction, nothing merged" || bad "main moved: rc=$rc $out"
   reset_stub; out=$(pm 7 --dry-run --unaffected src 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "touching documents and --unaffected paths only (src/a.swift); going on" && ok "merge: a code commit under an --unaffected path does not block (0.4.37)" || bad "unaffected path: rc=$rc $out"
-  reset_stub; out=$(pm 7 --dry-run --unaffected src/ --strict 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "refusing under --strict: .*touching documents and --unaffected paths only" && ok "merge: --strict refuses an --unaffected code commit too" || bad "strict with unaffected: rc=$rc $out"
+  reset_stub; out=$(pm 7 --dry-run --unaffected src/ --strict 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "refusing: under --strict: .*touching documents and --unaffected paths only" && ok "merge: --strict refuses an --unaffected code commit too" || bad "strict with unaffected: rc=$rc $out"
   reset_stub; out=$(pm 7 --dry-run --unaffected ./src/ 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "going on" && ok "merge: --unaffected takes ./src/ as src" || bad "normalised path: rc=$rc $out"
   ( cd "$mg/other" && mkdir -p srcx app/src && echo c > srcx/b.swift && echo c > app/src/c.swift && gitm add -A && gitm commit -q -m base3 && gitm push -q origin HEAD:main )
-  reset_stub; out=$(pm 7 --dry-run --unaffected src 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "touching code (app/src/c.swift …)" && ok "merge: --unaffected is a path prefix: srcx/ and app/src/ are not under src/" || bad "prefix match: rc=$rc $out"
+  reset_stub; out=$(pm 7 --dry-run --unaffected src 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "touching code (app/src/c.swift …; targets: app/src srcx)" && ok "merge: --unaffected is a path prefix: srcx/ and app/src/ are not under src/" || bad "prefix match: rc=$rc $out"
   reset_stub; out=$(pm 7 --dry-run --unaffected src --unaffected srcx --unaffected app/src 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "touching documents and --unaffected paths only (app/src/c.swift src/a.swift srcx/b.swift); going on" && ok "merge: several --unaffected paths cover several commits" || bad "several paths: rc=$rc $out"
   pm 7 --unaffected >/dev/null 2>&1; check "merge: --unaffected without a path is a usage error" $? 2
   pm 7 --unaffected / >/dev/null 2>&1; check "merge: --unaffected / is a usage error" $? 2
@@ -1427,6 +1450,9 @@ JSON
   pm --dry-run >/dev/null 2>&1; check "merge: no PR number is a usage error, exit 2" $? 2
   reset_stub; out=$(pm --dry-run 7 2>&1); rc=$?; [ $rc = 0 ] && printf '%s' "$out" | grep -q "dry run: #7" && ok "merge: the options may come before the PR number" || bad "options first: rc=$rc $out"
   pm 7 --bogus >/dev/null 2>&1; check "merge: an unknown option is a usage error, exit 2" $? 2
+  # A code file at the repository root names "." as its target (review 68); the last scenario, so nothing after it needs feature to take main in.
+  ( cd "$mg/other" && gitm pull -q --ff-only origin main && echo p > Package.swift && gitm add -A && gitm commit -q -m rootfile && gitm push -q origin HEAD:main )
+  reset_stub; out=$(pm 7 --dry-run 2>&1); rc=$?; [ $rc = 1 ] && printf '%s' "$out" | grep -q "touching code (Package.swift; targets: .)" && ok "merge: a code file at the root is the target \".\"" || bad "root target: rc=$rc $out"
   h=$(bash "$here/scripts/pr-merge.sh" --help); printf '%s' "$h" | grep -q -- '--wait-mergeable' && [ "$(printf '%s' "$h" | tail -1)" = "default 5) is for the tests." ] && ok "merge: --help prints the whole header" || bad "merge --help: $(printf '%s' "$h" | tail -1)"
 fi
 

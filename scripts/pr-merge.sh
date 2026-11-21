@@ -24,7 +24,7 @@
 # the base and the head from origin into refs of its own (refs/pr-merge/<pr>/, removed when it exits), so the
 # clone's refspec does not matter and two runs for two PRs in one repository do not mix.
 # --dry-run runs every check and the wait, prints what would merge and exits 0 without merging (exit 1 on a refusal),
-# so the script can be tried on a live PR. The fetch lands in the checkout the script runs from (refs of its own,
+# so the script can be tried on a live PR. Every refusal ends on a line saying REFUSED and exits 1. The fetch lands in the checkout the script runs from (refs of its own,
 # removed on exit): run it from your shift's checkout, not a shared one. PR_MERGE_POLL (seconds between checks,
 # default 5) is for the tests.
 set -eu
@@ -61,10 +61,13 @@ case "$pr" in *[!0-9]*)   # a branch name: its one open PR (a shift pasted a bra
   esac ;;
 esac
 poll="${PR_MERGE_POLL:-5}"
+# Every refusal prints its reason, then a last line that says REFUSED, and exits 1: a shift once read only the last line
+# of the output, took the refusal for a merge, and closed the issue.
+refuse() { echo "pr-merge.sh: refusing: $1" >&2; echo "pr-merge.sh: REFUSED #$pr; nothing merged." >&2; exit 1; }
 # The PR's state as `gh pr view` named it: MERGED, OPEN or CLOSED.
 pr_state() { gh api "repos/{owner}/{repo}/pulls/$1" --jq 'if .merged then "MERGED" else (.state | ascii_upcase) end'; }
 state=$(pr_state "$pr") || { echo "pr-merge.sh: cannot read #$pr" >&2; exit 1; }
-[ "$state" = OPEN ] || { echo "pr-merge.sh: #$pr is ${state:-unreadable}, not OPEN; nothing to merge" >&2; exit 1; }
+[ "$state" = OPEN ] || refuse "#$pr is ${state:-unreadable}, not OPEN; nothing to merge"
 base=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq .base.ref) || base=""; head=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq .head.ref) || head=""
 [ -n "$base" ] && [ -n "$head" ] || { echo "pr-merge.sh: cannot read the branches of #$pr" >&2; exit 1; }
 # The two tips, fetched into refs of this script's own, named for the PR and removed on exit: what the comparison
@@ -80,7 +83,7 @@ refresh() {
     # The list goes through the environment: BSD awk (macOS) refuses a newline in a -v value ("newline in string"), and
     # every --unaffected call exited 2 on the Mac in 0.4.37.
     own=$(git -c core.quotePath=off diff --no-renames --name-only "$rb...$rh" -- | PM_UNAFF="$unaff" awk 'BEGIN { n = split(ENVIRON["PM_UNAFF"], a, "\n") } { for (i = 1; i <= n; i++) if (a[i] != "" && index($0, a[i]) == 1) { print; exit } }')
-    [ -z "$own" ] || { echo "pr-merge.sh: refusing: --unaffected names a path #$pr ($head) itself changes ($own); a directory the PR touches is one its build sees. Drop that --unaffected, or merge $base in and rerun the build." >&2; exit 1; }
+    [ -z "$own" ] || refuse "--unaffected names a path #$pr ($head) itself changes ($own); a directory the PR touches is one its build sees. Drop that --unaffected, or merge $base in and rerun the build."
   fi
   if [ "$behind" -gt 0 ]; then
     # Documents cannot change a build: when every file the missing commits touch is one, the merge goes on and says so.
@@ -96,12 +99,14 @@ refresh() {
     fi
     shown=$(printf '%s\n' "$files" | tr '\n' ' ' | sed 's/ $//'); [ -n "$shown" ] || shown="no files"
     if [ -n "$code" ]; then
-      echo "pr-merge.sh: refusing: origin/$base has $behind commit(s) that #$pr ($head) does not, touching code ($(printf '%s\n' "$code" | head -1)$( [ "$(printf '%s\n' "$code" | grep -c .)" -gt 1 ] && printf ' …' )). Merge $base into $head, rerun the build and the tests the PR touches, push, then run this again. (Two PRs each clean against an older $base once broke it.)" >&2
-      exit 1
+      # The targets those files sit in (the first two path components, one for a file one level down, "." for a file at
+      # the root), so the session knows what to rebuild: a refusal once caught a tools/ package that no longer compiled,
+      # which "the tests the PR touches" did not name.
+      targets=$(printf '%s\n' "$code" | sed -e 's|^\([^/]*/[^/]*\)/.*$|\1|' -e t -e 's|^\([^/]*\)/[^/]*$|\1|' -e t -e 's|^[^/]*$|.|' | sort -u | tr '\n' ' ' | sed 's/ $//')
+      refuse "origin/$base has $behind commit(s) that #$pr ($head) does not, touching code ($(printf '%s\n' "$code" | head -1)$( [ "$(printf '%s\n' "$code" | grep -c .)" -gt 1 ] && printf ' …' ); targets: $targets). Merge $base into $head, rebuild those targets and the PR's own, rerun the tests the PR touches, push, then run this again. (Two PRs each clean against an older $base once broke it.)"
     fi
     if [ -n "$strict" ]; then
-      echo "pr-merge.sh: refusing under --strict: origin/$base has $behind commit(s) that #$pr ($head) does not, touching $kind ($shown). Merge $base into $head, push, then run this again." >&2
-      exit 1
+      refuse "under --strict: origin/$base has $behind commit(s) that #$pr ($head) does not, touching $kind ($shown). Merge $base into $head, push, then run this again."
     fi
     [ -n "$noted" ] || echo "note: origin/$base has $behind commit(s) that #$pr ($head) does not, touching $kind ($shown); going on, since none of them can change this PR's build (--strict refuses this too)."
     noted=1
@@ -114,15 +119,15 @@ while :; do
   m=$(gh api "repos/{owner}/{repo}/pulls/$pr" --jq 'if .mergeable == true then "MERGEABLE" elif .mergeable == false then "CONFLICTING" else "UNKNOWN" end' 2>/dev/null) || m=""
   case "$m" in
     MERGEABLE) break ;;
-    CONFLICTING) echo "pr-merge.sh: refusing: GitHub reports #$pr CONFLICTING. Merge $base into $head and resolve, rebuild, push; the fix gets its review round." >&2; exit 1 ;;
-    *) if [ "$(date +%s)" -ge "$deadline" ]; then echo "pr-merge.sh: refusing: mergeability of #$pr is still ${m:-unknown} after ${wait_m}s; GitHub has not computed it. Wait and run this again; never merge on UNKNOWN." >&2; exit 1; fi; sleep "$poll" ;;
+    CONFLICTING) refuse "GitHub reports #$pr CONFLICTING. Merge $base into $head and resolve, rebuild, push; the fix gets its review round." ;;
+    *) if [ "$(date +%s)" -ge "$deadline" ]; then refuse "mergeability of #$pr is still ${m:-unknown} after ${wait_m}s; GitHub has not computed it. Wait and run this again; never merge on UNKNOWN."; fi; sleep "$poll" ;;
   esac
 done
 refresh   # the base may have moved while we waited: the shift's case was two merges minutes apart
 head_sha=$(git rev-parse "$rh")
 if [ -n "$dry" ]; then echo "dry run: #$pr ($head into $base, $method) would merge at $head_sha if the head is unchanged by then; every check passed, nothing merged."; exit 0; fi
 # `sha` is the head the checks saw: GitHub refuses the merge when the branch moved since (gh pr merge's --match-head-commit).
-gh api -X PUT "repos/{owner}/{repo}/pulls/$pr/merge" -f merge_method="$method" -f sha="$head_sha" >/dev/null || { echo "pr-merge.sh: GitHub refused the merge of #$pr; nothing was merged. Do not close the issue; read the message above (a head pushed since the check, a merge method the repository does not allow, a conflict)." >&2; exit 1; }
+gh api -X PUT "repos/{owner}/{repo}/pulls/$pr/merge" -f merge_method="$method" -f sha="$head_sha" >/dev/null || refuse "GitHub refused the merge of #$pr; nothing was merged. Do not close the issue; read the message above (a head pushed since the check, a merge method the repository does not allow, a conflict)."
 deadline=$(( $(date +%s) + 60 ))
 while :; do
   state=$(pr_state "$pr" 2>/dev/null) || state=""
